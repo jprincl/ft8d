@@ -4,6 +4,7 @@ program ft8d
 
   include 'ft8_params.f90'
   character infile*80,msg37*37
+  character intime*10
   !character date*6,time*4
   character df*8
   character msgcall*13,msggrid*4
@@ -23,8 +24,8 @@ program ft8d
   apsym(30)=99
 
   nargs=iargc()
-  if(nargs.ne.1) then
-    print*,'Usage: ft8d file'
+  if(nargs.ne.2) then
+    print*,'Usage: ft8d file time'
     go to 999
   endif
 
@@ -33,6 +34,7 @@ program ft8d
   nfqso=0
 
   call getarg(1,infile)
+  call getarg(2,intime)
   open(10,file=infile,status='old',access='stream')
   read(10,end=999) dd
   ! read(10,end=999) dialfreq,dd
@@ -93,11 +95,9 @@ program ft8d
           ndecodes=ndecodes+1
           allmessages(ndecodes)=msg37
           allsnrs(ndecodes)=nsnr
-          ! write(*,1004) date,time,15*(ipart-1),min(sync,999.0),nint(xsnr), &
-          write(*,1004) 15*(ipart-1),min(sync,999.0),nint(xsnr), &
-              !xdt,nint(f1-2000+dialfreq),msgcall,msggrid
-              xdt,nint(f1-2000+dialfreq),msg37,msggrid
-1004      format(1x,i2.2,f6.1,i4,f6.2,i9,1x,a20,1x,a4)
+          write(*,1004) intime,15*(ipart-1),min(sync,999.0),nint(xsnr), &
+              xdt,nint(f1-2000+dialfreq),msg37
+1004      format(a10,1x,i2.2,f6.1,i4,f6.2,i9,1x,a20)
         endif
       enddo
     enddo
