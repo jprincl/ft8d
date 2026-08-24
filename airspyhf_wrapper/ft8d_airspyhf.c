@@ -131,17 +131,17 @@ static double haversine_km(double lat1, double lon1, double lat2, double lon2)
     return R * c;
 }
 
-/* Looks at the last whitespace-separated token of a decoded line (i.e.
- * the last token of the message, since nothing follows it). Returns 1
- * and fills grid_out (5 bytes incl. NUL) if it's a genuine locator --
- * explicitly excludes RR73/RRR/73 and signal reports, which can be
- * syntactically indistinguishable from (or adjacent to) a real grid. */
-static int extract_locator(const char *line, char *grid_out)
+/* Looks at the last whitespace-separated token of the (already-trimmed)
+ * message text. Returns 1 and fills grid_out (5 bytes incl. NUL) if it's
+ * a genuine locator -- explicitly excludes RR73/RRR/73 and signal
+ * reports, which can be syntactically indistinguishable from (or
+ * adjacent to) a real grid. */
+static int extract_locator(const char *msg, char *grid_out)
 {
-    const char *end = line + strlen(line);
-    while (end > line && isspace((unsigned char)*(end - 1))) end--;
+    const char *end = msg + strlen(msg);
+    while (end > msg && isspace((unsigned char)*(end - 1))) end--;
     const char *start = end;
-    while (start > line && !isspace((unsigned char)*(start - 1))) start--;
+    while (start > msg && !isspace((unsigned char)*(start - 1))) start--;
     size_t len = (size_t)(end - start);
 
     if (len != 4) return 0;
@@ -158,27 +158,51 @@ static int extract_locator(const char *line, char *grid_out)
 }
 
 /* Parse a completed line from ft8d's stdout, append locator/distance
- * columns if applicable, and print the result. */
+ * columns if applicable, and print the result with fixed-width columns
+ * we control ourselves (Fortran's a20 padding for the message breaks
+ * down for any message over 20 chars, so we don't rely on it). */
 static void process_decode_line(char *line)
 {
     size_t len = strlen(line);
-    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' ||
-                        line[len - 1] == ' '))
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
         line[--len] = '\0';
     if (len == 0) return;
 
+    /* ft8d.f90's format is a6,1x,f6.1,i4,f6.2,i9,1x,a20 -- dtime..freq is
+     * reliably 32 chars, message starts right after the following space. */
+    const size_t PREFIX_LEN = 32;
+    char prefix[64];
+    const char *msg_start;
+    if (len > PREFIX_LEN + 1) {
+        size_t n = PREFIX_LEN < sizeof(prefix) - 1 ? PREFIX_LEN : sizeof(prefix) - 1;
+        memcpy(prefix, line, n);
+        prefix[n] = '\0';
+        msg_start = line + PREFIX_LEN + 1; /* skip the 1x separator */
+    } else {
+        prefix[0] = '\0';
+        msg_start = line;
+    }
+
+    char msg[64];
+    strncpy(msg, msg_start, sizeof(msg) - 1);
+    msg[sizeof(msg) - 1] = '\0';
+    size_t mlen = strlen(msg);
+    while (mlen > 0 && isspace((unsigned char)msg[mlen - 1]))
+        msg[--mlen] = '\0';
+    if (mlen == 0) return;
+
     char grid[5];
-    if (extract_locator(line, grid)) {
+    if (extract_locator(msg, grid)) {
         if (g_have_home) {
             double lat, lon;
             grid_to_latlon(grid, &lat, &lon);
             double dist = haversine_km(g_home_lat, g_home_lon, lat, lon);
-            printf("%s  %s  %.0fkm\n", line, grid, dist);
+            printf("%s %-20s %-6s %6.0fkm\n", prefix, msg, grid, dist);
         } else {
-            printf("%s  %s\n", line, grid);
+            printf("%s %-20s %-6s\n", prefix, msg, grid);
         }
     } else {
-        printf("%s\n", line);
+        printf("%s %-20s\n", prefix, msg);
     }
     fflush(stdout);
 }
