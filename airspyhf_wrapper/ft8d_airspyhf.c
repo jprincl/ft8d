@@ -21,8 +21,8 @@
  *   -sn  SNR descending (strongest first)
  *
  * -l <log_dir>  also write decodes (no tracing info) to a file named
- *               ft8_<startdate><starttime>_<freq_Hz>.txt in that
- *               directory, e.g. ft8_20260824080614_14075500.txt.
+ *               <freq_kHz>_<startdate>_<starttime>.ft8 in that
+ *               directory, e.g. 18100_20260824_130923.ft8.
  *               Each 15s interval, decoded or not, ends with a blank
  *               line so the log shows a continuous timeline.
  * -q            suppress screen output. Only useful together with -l --
@@ -637,10 +637,10 @@ int main(int argc, char **argv)
         const char *sep = (dl > 0 && log_dir[dl - 1] == '/') ? "" : "/";
         char logpath[512];
         snprintf(logpath, sizeof(logpath),
-                 "%s%sft8_%04d%02d%02d%02d%02d%02d_%.0f.txt",
-                 log_dir, sep,
+                 "%s%s%.0f_%04d%02d%02d_%02d%02d%02d.ft8",
+                 log_dir, sep, freq_khz,
                  tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-                 tmv.tm_hour, tmv.tm_min, tmv.tm_sec, g_dial_freq_hz);
+                 tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
         g_logfile = fopen(logpath, "a");
         if (!g_logfile) {
             fprintf(stderr, "could not open log file %s: %s\n",
