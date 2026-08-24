@@ -30,7 +30,7 @@
 #define FIR_NTAPS        1025
 #define FIR_CUTOFF_HZ    1900.0
 
-#define FT8D_PATH        "../ft8d"   /* adjust if your layout differs */
+#define FT8D_PATH        "./ft8d"   /* adjust if your layout differs */
 #define MAX_CHILDREN     8
 #define CHILD_TIMEOUT_S  45          /* decode should finish well inside 60 s */
 
