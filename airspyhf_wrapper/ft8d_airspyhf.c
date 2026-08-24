@@ -2,11 +2,13 @@
  * ft8d_airspyhf - Airspy HF+ front end feeding ft8d directly, no external
  * csdr/airspyhf_rx processes involved.
  *
- * v1: single fixed frequency, no band rotation yet (that comes later).
+ * Usage: ft8d_airspyhf -f <freq_kHz>[,<freq_kHz>...] [-h <home_locator>]
+ *                       [-sf|-sd|-sn] [-l <log_dir>] [-q] [-d <minutes>]
+ *   e.g. ft8d_airspyhf -f 14074,18100,21074 -h JO70 -sd -l /home/odroid/ft8logs -d 30
  *
- * Usage: ft8d_airspyhf -f <freq_kHz> [-h <home_locator>] [-sf|-sd|-sn]
- *                       [-l <log_dir>] [-q]
- *   e.g. ft8d_airspyhf -f 14074 -h JO70 -sd -l /home/odroid/ft8logs
+ * -f takes one frequency (no rotation) or a comma-separated list. With a
+ * list, bands rotate one minute each, retuning the live device handle --
+ * no reopening. Each band gets its own log/diff file if -l is given.
  *
  * -h is optional. When given, a genuine locator found in a decoded
  * message gets a distance-in-km column appended (e.g. "JN53  1560km").
@@ -22,14 +24,25 @@
  *
  * -l <log_dir>  also write decodes (no tracing info) to a file named
  *               <freq_kHz>_<startdate>_<starttime>.ft8 in that
- *               directory, e.g. 18100_20260824_130923.ft8.
- *               Each 15s interval, decoded or not, ends with a blank
- *               line so the log shows a continuous timeline.
+ *               directory, e.g. 18100_20260824_130923.ft8, one per band,
+ *               kept open until the program exits. Each 15s interval,
+ *               decoded or not, ends with a blank line so the log shows
+ *               a continuous timeline.
  * -q            suppress screen output. Only useful together with -l --
  *               refused if given without it (nothing would go anywhere).
- * Default (neither given): screen only, as before. -l alone: both.
- * -l with -q: file only.
+ * -d <minutes>  differential mode, window 5-180 minutes, reset on every
+ *               restart. A callsign already flagged as new on its band
+ *               within the window is suppressed from the screen and the
+ *               per-band "<...>_d.ft8" file (only created if -l is also
+ *               given) -- but always still goes to the main archive
+ *               file, which stays a complete, unfiltered log regardless.
+ *
+ * Default (neither -l nor -q given): screen only, everything. -l alone:
+ * both screen and file, everything. -l with -q: file only. Adding -d
+ * filters screen and adds the "_d" file; the main archive is unaffected.
  */
+
+#define _POSIX_C_SOURCE 200809L /* gmtime_r, strdup -- explicit, don't rely on GNU-dialect defaults */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +56,10 @@
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <libairspyhf/airspyhf.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #define SAMPLE_RATE_HZ   192000u   /* native Airspy HF+ rate we ask for */
 #define DECIM            48        /* 192000 / 48 = 4000, exactly what ft8d wants */
@@ -71,6 +88,8 @@
 #define FREQ_OFFSET_HZ   1500.0
 
 #define MAX_RECS_PER_CYCLE 128
+#define MAX_BANDS 16
+#define MAX_TRACKED_CALLS 512
 
 typedef struct { float re, im; } cplx32_t;
 
@@ -96,9 +115,20 @@ typedef struct {
     int     readfd;       /* read end of ft8d's redirected stdout */
     char    linebuf[256]; /* partial (not yet newline-terminated) output */
     int     linelen;
+    int     band_idx;     /* which band this decode belongs to, tagged at launch */
     decode_rec_t recs[MAX_RECS_PER_CYCLE];
     int          nrecs;
 } child_t;
+
+typedef struct { char call[16]; time_t last_seen; } call_seen_t;
+typedef struct { call_seen_t seen[MAX_TRACKED_CALLS]; int count; } band_dedup_t;
+
+static airspyhf_device_t *g_dev = NULL;
+
+static double g_band_freq_khz[MAX_BANDS];
+static int    g_nbands = 0;
+static int    g_band_idx = 0;
+static time_t g_band_start = 0;
 
 static double        g_dial_freq_hz = 14074000.0;  /* nominal, for display only */
 static double        g_rf_center_hz = 0.0;          /* dial + FREQ_OFFSET_HZ -- used for BOTH tuning and the .c2 filename, must always match */
@@ -111,13 +141,20 @@ static int                g_outcount = 0;
 static child_t             g_children[MAX_CHILDREN];
 static volatile sig_atomic_t g_stop = 0;
 static sort_mode_t            g_sort_mode = SORT_FREQ;
+static int                     g_armed = 0; /* have we hit a real 15s UTC boundary yet? */
+static int                     g_last_checked_sec = -1;
 
 static int    g_have_home = 0;
 static double g_home_lat = 0.0, g_home_lon = 0.0;
 static char   g_home_grid[8] = {0};
 
 static int    g_want_screen = 1; /* -q turns this off */
-static FILE  *g_logfile = NULL;  /* set when -l is given */
+static FILE  *g_logfiles[MAX_BANDS];  /* main per-band archive, set when -l is given */
+static FILE  *g_difffiles[MAX_BANDS]; /* per-band "_d" novelty-only file, needs -l and -d together */
+
+static int          g_diff_mode = 0;
+static int           g_diff_window_min = 0;
+static band_dedup_t   g_dedup[MAX_BANDS];
 
 static void handle_sigint(int sig) { (void)sig; g_stop = 1; }
 
@@ -170,6 +207,39 @@ static double haversine_km(double lat1, double lon1, double lat2, double lon2)
                sin(dlon / 2) * sin(dlon / 2);
     double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
     return R * c;
+}
+
+/* True if `call` on this band hasn't been flagged as new in the last
+ * g_diff_window_min minutes (or has never been seen at all). Per-band,
+ * matching the confirmed dedup scope. Mirrors Jan's old diff.sh
+ * semantics: the window is measured from when a call was LAST flagged
+ * as new, not refreshed on every intervening sighting -- so once it's
+ * quiet for the window, it can be flagged again. */
+static int dedup_is_new(int band, const char *call, time_t now)
+{
+    if (call[0] == '\0') return 1; /* nothing to key on, don't gate it */
+    band_dedup_t *d = &g_dedup[band];
+    for (int i = 0; i < d->count; i++) {
+        if (strcmp(d->seen[i].call, call) == 0) {
+            if (now - d->seen[i].last_seen < g_diff_window_min * 60)
+                return 0; /* still within the window, not new */
+            d->seen[i].last_seen = now; /* re-arm */
+            return 1;
+        }
+    }
+    int slot = d->count;
+    if (slot >= MAX_TRACKED_CALLS) {
+        int oldest = 0;
+        for (int i = 1; i < d->count; i++)
+            if (d->seen[i].last_seen < d->seen[oldest].last_seen) oldest = i;
+        slot = oldest;
+    } else {
+        d->count++;
+    }
+    strncpy(d->seen[slot].call, call, sizeof(d->seen[slot].call) - 1);
+    d->seen[slot].call[sizeof(d->seen[slot].call) - 1] = '\0';
+    d->seen[slot].last_seen = now;
+    return 1;
 }
 
 /* Looks at the last whitespace-separated token of the (already-trimmed)
@@ -320,13 +390,19 @@ static void process_decode_line(child_t *c, char *line)
     }
 }
 
-/* Sort this child's buffered decodes per g_sort_mode and write them to
- * whichever destination(s) are active (screen and/or log file -- the
- * log file only ever gets decode lines, never the stderr tracing).
- * Every interval, including a quiet one with zero decodes, ends with a
- * blank-line separator so the log shows a continuous timeline. */
+/* Sort this child's buffered decodes per g_sort_mode and write them out.
+ * The per-band archive file (if -l given) always gets everything. Screen
+ * and the per-band "_d" file (if -d given) only get lines whose callsign
+ * passes the dedup filter -- i.e. wasn't already flagged new within the
+ * window on this band. Every interval, including a quiet one, ends with
+ * a blank-line separator on every active destination. */
 static void flush_child_output(child_t *c)
 {
+    int band = c->band_idx;
+    FILE *archive = g_logfiles[band];
+    FILE *diff_f = g_difffiles[band];
+    time_t now = time(NULL);
+
     if (c->nrecs > 0) {
         int (*cmp)(const void *, const void *) = cmp_freq;
         if (g_sort_mode == SORT_DIST) cmp = cmp_dist;
@@ -353,12 +429,18 @@ static void flush_child_output(child_t *c)
             else if (r->has_grid)
                 snprintf(outline + off, sizeof(outline) - off, " %-6s", r->grid);
 
-            if (g_want_screen) printf("%s\n", outline);
-            if (g_logfile) fprintf(g_logfile, "%s\n", outline);
+            if (archive) fprintf(archive, "%s\n", outline);
+
+            int is_new = !g_diff_mode || dedup_is_new(band, r->call, now);
+            if (is_new) {
+                if (g_want_screen) printf("%s\n", outline);
+                if (diff_f) fprintf(diff_f, "%s\n", outline);
+            }
         }
     }
     if (g_want_screen) { printf("\n"); fflush(stdout); }
-    if (g_logfile) { fprintf(g_logfile, "\n"); fflush(g_logfile); }
+    if (archive) { fprintf(archive, "\n"); fflush(archive); }
+    if (diff_f) { fprintf(diff_f, "\n"); fflush(diff_f); }
     c->nrecs = 0;
 }
 
@@ -454,6 +536,7 @@ static void launch_decode(const char *path)
         g_children[slot].readfd = pfd[0];
         g_children[slot].linelen = 0;
         g_children[slot].nrecs = 0;
+        g_children[slot].band_idx = g_band_idx;
         g_children[slot].used = 1;
     } else {
         perror("fork");
@@ -461,6 +544,31 @@ static void launch_decode(const char *path)
         close(pfd[1]);
         unlink(path);
     }
+}
+
+/* If rotating (more than one band) and we've held the current band for
+ * at least 60s, retune to the next one on the live device handle -- no
+ * reopening. Discards any in-flight buffer/FIR history and forces a
+ * fresh wait for the next 15s UTC boundary, since samples right after a
+ * retune are transitional and shouldn't be mixed with the new band. */
+static void maybe_rotate_band(void)
+{
+    if (g_nbands <= 1) return;
+    time_t now = time(NULL);
+    if (now - g_band_start < 60) return;
+
+    g_band_idx = (g_band_idx + 1) % g_nbands;
+    g_band_start = now;
+    g_dial_freq_hz = g_band_freq_khz[g_band_idx] * 1000.0;
+    g_rf_center_hz = g_dial_freq_hz + FREQ_OFFSET_HZ;
+    airspyhf_set_freq(g_dev, (uint32_t)g_rf_center_hz);
+
+    memset(g_fir_hist, 0, sizeof(g_fir_hist));
+    g_fir_pos = 0;
+    g_decim_ctr = 0;
+    g_outcount = 0;
+    g_armed = 0;
+    fprintf(stderr, "rotating to %.3f kHz\n", g_band_freq_khz[g_band_idx]);
 }
 
 /* Filename must end in exactly HHMMSS_FREQ8.c2 -- ft8d.f90 parses those
@@ -495,10 +603,8 @@ static void write_c2_and_launch(void)
 
     launch_decode(path);
     g_outcount = 0;
+    maybe_rotate_band();
 }
-
-static int g_armed = 0;          /* have we hit a real 15s UTC boundary yet? */
-static int g_last_checked_sec = -1;
 
 static void append_output_sample(float re, float im)
 {
@@ -571,12 +677,12 @@ static int rx_callback(airspyhf_transfer_t *transfer)
 
 int main(int argc, char **argv)
 {
-    double freq_khz = -1.0;
+    const char *freq_arg = NULL;
     const char *home_arg = NULL;
     const char *log_dir = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-f") == 0 && i + 1 < argc)
-            freq_khz = atof(argv[++i]);
+            freq_arg = argv[++i];
         else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc)
             home_arg = argv[++i];
         else if (strcmp(argv[i], "-sf") == 0)
@@ -595,14 +701,35 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "-q") == 0)
             g_want_screen = 0;
+        else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+            g_diff_window_min = atoi(argv[++i]);
+            g_diff_mode = 1;
+        }
     }
-    if (freq_khz <= 0.0) {
-        fprintf(stderr, "Usage: %s -f <freq_kHz> [-h <home_locator>] "
-                "[-sf|-sd|-sn] [-l <log_dir>] [-q]\n", argv[0]);
+    if (!freq_arg) {
+        fprintf(stderr, "Usage: %s -f <freq_kHz>[,<freq_kHz>...] [-h <home_locator>] "
+                "[-sf|-sd|-sn] [-l <log_dir>] [-q] [-d <minutes>]\n", argv[0]);
+        return 1;
+    }
+    {
+        char *fcopy = strdup(freq_arg);
+        char *tok = strtok(fcopy, ",");
+        while (tok && g_nbands < MAX_BANDS) {
+            g_band_freq_khz[g_nbands++] = atof(tok);
+            tok = strtok(NULL, ",");
+        }
+        free(fcopy);
+    }
+    if (g_nbands == 0) {
+        fprintf(stderr, "no valid frequency in -f '%s'\n", freq_arg);
         return 1;
     }
     if (!g_want_screen && !log_dir) {
         fprintf(stderr, "-q with no -l means no output would go anywhere\n");
+        return 1;
+    }
+    if (g_diff_mode && (g_diff_window_min < 5 || g_diff_window_min > 180)) {
+        fprintf(stderr, "-d window must be between 5 and 180 minutes\n");
         return 1;
     }
     if (home_arg) {
@@ -626,7 +753,8 @@ int main(int argc, char **argv)
         strncpy(g_home_grid, g, sizeof(g_home_grid) - 1);
         g_have_home = 1;
     }
-    g_dial_freq_hz = freq_khz * 1000.0;
+    g_band_idx = 0;
+    g_dial_freq_hz = g_band_freq_khz[0] * 1000.0;
     g_rf_center_hz = g_dial_freq_hz + FREQ_OFFSET_HZ;
 
     if (log_dir) {
@@ -635,27 +763,41 @@ int main(int argc, char **argv)
         gmtime_r(&start, &tmv);
         size_t dl = strlen(log_dir);
         const char *sep = (dl > 0 && log_dir[dl - 1] == '/') ? "" : "/";
-        char logpath[512];
-        snprintf(logpath, sizeof(logpath),
-                 "%s%s%.0f_%04d%02d%02d_%02d%02d%02d.ft8",
-                 log_dir, sep, freq_khz,
-                 tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-                 tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
-        g_logfile = fopen(logpath, "a");
-        if (!g_logfile) {
-            fprintf(stderr, "could not open log file %s: %s\n",
-                    logpath, strerror(errno));
-            return 1;
+        for (int b = 0; b < g_nbands; b++) {
+            char logpath[512];
+            snprintf(logpath, sizeof(logpath),
+                     "%s%s%.0f_%04d%02d%02d_%02d%02d%02d.ft8",
+                     log_dir, sep, g_band_freq_khz[b],
+                     tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                     tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+            g_logfiles[b] = fopen(logpath, "a");
+            if (!g_logfiles[b]) {
+                fprintf(stderr, "could not open log file %s: %s\n",
+                        logpath, strerror(errno));
+                return 1;
+            }
+            fprintf(stderr, "logging decodes to %s\n", logpath);
+
+            if (g_diff_mode) {
+                char diffpath[520];
+                snprintf(diffpath, sizeof(diffpath), "%.*s_d.ft8",
+                         (int)(strlen(logpath) - 4), logpath);
+                g_difffiles[b] = fopen(diffpath, "a");
+                if (!g_difffiles[b]) {
+                    fprintf(stderr, "could not open diff file %s: %s\n",
+                            diffpath, strerror(errno));
+                    return 1;
+                }
+                fprintf(stderr, "logging new-only decodes to %s\n", diffpath);
+            }
         }
-        fprintf(stderr, "logging decodes to %s\n", logpath);
     }
 
     design_lowpass(g_fir_coef, FIR_NTAPS, (double)SAMPLE_RATE_HZ, FIR_CUTOFF_HZ);
     memset(g_children, 0, sizeof(g_children));
     signal(SIGINT, handle_sigint);
 
-    airspyhf_device_t *dev = NULL;
-    if (airspyhf_open(&dev) != AIRSPYHF_SUCCESS) {
+    if (airspyhf_open(&g_dev) != AIRSPYHF_SUCCESS) {
         fprintf(stderr, "airspyhf_open failed (device plugged in? plugdev group?)\n");
         return 1;
     }
@@ -663,9 +805,9 @@ int main(int argc, char **argv)
     /* Confirm 192 kS/s is actually offered before committing to it --
      * the list varies by firmware, per the earlier discussion. */
     uint32_t rate_count = 0;
-    airspyhf_get_samplerates(dev, &rate_count, 0);
+    airspyhf_get_samplerates(g_dev, &rate_count, 0);
     uint32_t *rates = malloc(rate_count * sizeof(uint32_t));
-    airspyhf_get_samplerates(dev, rates, rate_count);
+    airspyhf_get_samplerates(g_dev, rates, rate_count);
     int have_rate = 0;
     for (uint32_t i = 0; i < rate_count; i++)
         if (rates[i] == SAMPLE_RATE_HZ) have_rate = 1;
@@ -673,40 +815,56 @@ int main(int argc, char **argv)
     if (!have_rate) {
         fprintf(stderr, "device does not offer %u sps -- check firmware's rate list\n",
                 SAMPLE_RATE_HZ);
-        airspyhf_close(dev);
+        airspyhf_close(g_dev);
         return 1;
     }
 
-    airspyhf_set_samplerate(dev, SAMPLE_RATE_HZ);
+    airspyhf_set_samplerate(g_dev, SAMPLE_RATE_HZ);
     /* Tune to g_rf_center_hz (dial + FREQ_OFFSET_HZ), the SAME value used
      * in the .c2 filename above -- hardware tuning and the embedded
      * dialfreq must always match, or the frequency column comes out
      * wrong even though decoding itself still works fine. */
-    airspyhf_set_freq(dev, (uint32_t)g_rf_center_hz);
-    airspyhf_set_hf_agc(dev, 1);   /* matches -g on */
-    airspyhf_set_hf_lna(dev, 1);   /* matches -m on */
+    airspyhf_set_freq(g_dev, (uint32_t)g_rf_center_hz);
+    airspyhf_set_hf_agc(g_dev, 1);   /* matches -g on */
+    airspyhf_set_hf_lna(g_dev, 1);   /* matches -m on */
 
-    if (airspyhf_start(dev, rx_callback, NULL) != AIRSPYHF_SUCCESS) {
+    if (airspyhf_start(g_dev, rx_callback, NULL) != AIRSPYHF_SUCCESS) {
         fprintf(stderr, "airspyhf_start failed\n");
-        airspyhf_close(dev);
+        airspyhf_close(g_dev);
         return 1;
     }
+    g_band_start = time(NULL);
 
     const char *sort_name = g_sort_mode == SORT_DIST ? "distance" :
                              g_sort_mode == SORT_SNR  ? "SNR" : "frequency";
-    fprintf(stderr, "receiving dial %.3f kHz (RF center %.3f kHz, "
-            "covering %.0f - %.0f Hz)%s%s, sort by %s, Ctrl+C to stop\n",
-            freq_khz, g_rf_center_hz / 1000.0,
-            g_rf_center_hz - 1600.0, g_rf_center_hz + 1600.0,
-            g_have_home ? ", home " : "",
-            g_have_home ? g_home_grid : "",
-            sort_name);
-    while (!g_stop && airspyhf_is_streaming(dev))
+    if (g_nbands == 1) {
+        fprintf(stderr, "receiving dial %.3f kHz (RF center %.3f kHz, "
+                "covering %.0f - %.0f Hz)%s%s, sort by %s",
+                g_band_freq_khz[0], g_rf_center_hz / 1000.0,
+                g_rf_center_hz - 1600.0, g_rf_center_hz + 1600.0,
+                g_have_home ? ", home " : "",
+                g_have_home ? g_home_grid : "",
+                sort_name);
+        if (g_diff_mode) fprintf(stderr, ", diff window %d min", g_diff_window_min);
+        fprintf(stderr, ", Ctrl+C to stop\n");
+    } else {
+        fprintf(stderr, "rotating %d bands (1 min each):", g_nbands);
+        for (int b = 0; b < g_nbands; b++)
+            fprintf(stderr, " %.3fkHz", g_band_freq_khz[b]);
+        fprintf(stderr, "%s%s, sort by %s", g_have_home ? ", home " : "",
+                g_have_home ? g_home_grid : "", sort_name);
+        if (g_diff_mode) fprintf(stderr, ", diff window %d min", g_diff_window_min);
+        fprintf(stderr, ", Ctrl+C to stop\n");
+    }
+    while (!g_stop && airspyhf_is_streaming(g_dev))
         sleep(1);
 
-    airspyhf_stop(dev);
-    airspyhf_close(dev);
+    airspyhf_stop(g_dev);
+    airspyhf_close(g_dev);
     reap_children(1);
-    if (g_logfile) fclose(g_logfile);
+    for (int b = 0; b < g_nbands; b++) {
+        if (g_logfiles[b]) fclose(g_logfiles[b]);
+        if (g_difffiles[b]) fclose(g_difffiles[b]);
+    }
     return 0;
 }
