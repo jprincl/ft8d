@@ -164,8 +164,27 @@ static void write_c2_and_launch(void)
     g_outcount = 0;
 }
 
+static int g_armed = 0;          /* have we hit a real 15s UTC boundary yet? */
+static int g_last_checked_sec = -1;
+
 static void append_output_sample(float re, float im)
 {
+    if (!g_armed) {
+        time_t now = time(NULL);
+        struct tm tmv;
+        gmtime_r(&now, &tmv);
+        if (tmv.tm_sec != g_last_checked_sec) {
+            g_last_checked_sec = tmv.tm_sec;
+            if (tmv.tm_sec % 15 == 0) {
+                g_armed = 1;
+                g_outcount = 0;
+                fprintf(stderr, "aligned to 15s UTC boundary, starting capture\n");
+            }
+        }
+        if (!g_armed)
+            return; /* still waiting for alignment -- discard this sample */
+    }
+
     if (g_outcount < NMAX) {
         g_outbuf[g_outcount].re = re;
         g_outbuf[g_outcount].im = im;
