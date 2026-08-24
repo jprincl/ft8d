@@ -558,7 +558,6 @@ static void maybe_rotate_band(void)
     if (now - g_band_start < 60) return;
 
     g_band_idx = (g_band_idx + 1) % g_nbands;
-    g_band_start = now;
     g_dial_freq_hz = g_band_freq_khz[g_band_idx] * 1000.0;
     g_rf_center_hz = g_dial_freq_hz + FREQ_OFFSET_HZ;
     airspyhf_set_freq(g_dev, (uint32_t)g_rf_center_hz);
@@ -617,6 +616,8 @@ static void append_output_sample(float re, float im)
             if (tmv.tm_sec % 15 == 0) {
                 g_armed = 1;
                 g_outcount = 0;
+                g_band_start = now; /* dwell budget starts NOW, not at retune time --
+                                       the alignment wait itself must not eat into it */
                 fprintf(stderr, "aligned to 15s UTC boundary, starting capture\n");
             }
         }
