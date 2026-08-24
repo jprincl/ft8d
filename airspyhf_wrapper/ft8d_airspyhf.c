@@ -4,17 +4,24 @@
  *
  * v1: single fixed frequency, no band rotation yet (that comes later).
  *
- * Usage: ft8d_airspyhf -f <freq_kHz>
- *   e.g. ft8d_airspyhf -f 14074
+ * Usage: ft8d_airspyhf -f <freq_kHz> [-h <home_locator>]
+ *   e.g. ft8d_airspyhf -f 14074 -h JO70
+ *
+ * -h is optional. When given, a genuine locator found in a decoded
+ * message gets a distance-in-km column appended (e.g. "JN53  1560km").
+ * RR73/RRR/73 and signal reports are never treated as locators, even
+ * though some are syntactically indistinguishable from a real grid.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <math.h>
 #include <time.h>
 #include <signal.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <libairspyhf/airspyhf.h>
 
@@ -30,7 +37,7 @@
 #define FIR_NTAPS        1025
 #define FIR_CUTOFF_HZ    1900.0
 
-#define FT8D_PATH        "./ft8d"   /* adjust if your layout differs */
+#define FT8D_PATH        "./ft8d"    /* adjust if your layout differs */
 #define MAX_CHILDREN     8
 #define CHILD_TIMEOUT_S  45          /* decode should finish well inside 60 s */
 
@@ -51,6 +58,9 @@ typedef struct {
     char    path[160];
     time_t  started;
     int     used;
+    int     readfd;       /* read end of ft8d's redirected stdout */
+    char    linebuf[256]; /* partial (not yet newline-terminated) output */
+    int     linelen;
 } child_t;
 
 static double        g_dial_freq_hz = 14074000.0;  /* nominal, for display only */
@@ -63,6 +73,10 @@ static cplx32_t          g_outbuf[NMAX];
 static int                g_outcount = 0;
 static child_t             g_children[MAX_CHILDREN];
 static volatile sig_atomic_t g_stop = 0;
+
+static int    g_have_home = 0;
+static double g_home_lat = 0.0, g_home_lon = 0.0;
+static char   g_home_grid[8] = {0};
 
 static void handle_sigint(int sig) { (void)sig; g_stop = 1; }
 
@@ -85,6 +99,111 @@ static void design_lowpass(float *coef, int ntaps, double fs, double fc)
         coef[n] = (float)(coef[n] / sum);
 }
 
+/* True if g[0..3] is a syntactically valid 4-char Maidenhead locator
+ * (2 letters A-R, 2 digits 0-9). Does NOT by itself rule out RR73 --
+ * that exclusion happens by exact-string-match in extract_locator(),
+ * since RR73 is syntactically indistinguishable from a real locator. */
+static int is_valid_grid4(const char *g)
+{
+    return g[0] >= 'A' && g[0] <= 'R' &&
+           g[1] >= 'A' && g[1] <= 'R' &&
+           g[2] >= '0' && g[2] <= '9' &&
+           g[3] >= '0' && g[3] <= '9';
+}
+
+static void grid_to_latlon(const char *grid, double *lat, double *lon)
+{
+    char c1 = (char)toupper((unsigned char)grid[0]);
+    char c2 = (char)toupper((unsigned char)grid[1]);
+    *lon = (c1 - 'A') * 20.0 - 180.0 + (grid[2] - '0') * 2.0 + 1.0;
+    *lat = (c2 - 'A') * 10.0 - 90.0 + (grid[3] - '0') * 1.0 + 0.5;
+}
+
+static double haversine_km(double lat1, double lon1, double lat2, double lon2)
+{
+    const double R = 6371.0; /* mean Earth radius, km */
+    double dlat = (lat2 - lat1) * M_PI / 180.0;
+    double dlon = (lon2 - lon1) * M_PI / 180.0;
+    double a = sin(dlat / 2) * sin(dlat / 2) +
+               cos(lat1 * M_PI / 180.0) * cos(lat2 * M_PI / 180.0) *
+               sin(dlon / 2) * sin(dlon / 2);
+    double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+    return R * c;
+}
+
+/* Looks at the last whitespace-separated token of a decoded line (i.e.
+ * the last token of the message, since nothing follows it). Returns 1
+ * and fills grid_out (5 bytes incl. NUL) if it's a genuine locator --
+ * explicitly excludes RR73/RRR/73 and signal reports, which can be
+ * syntactically indistinguishable from (or adjacent to) a real grid. */
+static int extract_locator(const char *line, char *grid_out)
+{
+    const char *end = line + strlen(line);
+    while (end > line && isspace((unsigned char)*(end - 1))) end--;
+    const char *start = end;
+    while (start > line && !isspace((unsigned char)*(start - 1))) start--;
+    size_t len = (size_t)(end - start);
+
+    if (len != 4) return 0;
+
+    char tok[5];
+    memcpy(tok, start, 4);
+    tok[4] = '\0';
+
+    if (strcmp(tok, "RR73") == 0) return 0; /* roger/sign-off, not a grid */
+    if (!is_valid_grid4(tok)) return 0;      /* also rejects things like R-09 */
+
+    memcpy(grid_out, tok, 5);
+    return 1;
+}
+
+/* Parse a completed line from ft8d's stdout, append locator/distance
+ * columns if applicable, and print the result. */
+static void process_decode_line(char *line)
+{
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' ||
+                        line[len - 1] == ' '))
+        line[--len] = '\0';
+    if (len == 0) return;
+
+    char grid[5];
+    if (extract_locator(line, grid)) {
+        if (g_have_home) {
+            double lat, lon;
+            grid_to_latlon(grid, &lat, &lon);
+            double dist = haversine_km(g_home_lat, g_home_lon, lat, lon);
+            printf("%s  %s  %.0fkm\n", line, grid, dist);
+        } else {
+            printf("%s  %s\n", line, grid);
+        }
+    } else {
+        printf("%s\n", line);
+    }
+    fflush(stdout);
+}
+
+/* Non-blocking drain of whatever ft8d has written so far, processing
+ * every complete (newline-terminated) line and keeping any trailing
+ * partial line buffered for next time. */
+static void drain_child_output(child_t *c)
+{
+    char buf[512];
+    for (;;) {
+        ssize_t n = read(c->readfd, buf, sizeof(buf));
+        if (n <= 0) break; /* EAGAIN (nothing available) or EOF */
+        for (ssize_t i = 0; i < n; i++) {
+            if (c->linelen < (int)sizeof(c->linebuf) - 1)
+                c->linebuf[c->linelen++] = buf[i];
+            if (buf[i] == '\n') {
+                c->linebuf[c->linelen] = '\0';
+                process_decode_line(c->linebuf);
+                c->linelen = 0;
+            }
+        }
+    }
+}
+
 /* Reap finished/overdue ft8d children and unlink their .c2 file every
  * time -- whether or not anything decoded, per the "always clean up"
  * rule, not just on success. */
@@ -93,9 +212,12 @@ static void reap_children(int force_all)
     time_t now = time(NULL);
     for (int i = 0; i < MAX_CHILDREN; i++) {
         if (!g_children[i].used) continue;
+        drain_child_output(&g_children[i]);
         int status;
         pid_t r = waitpid(g_children[i].pid, &status, WNOHANG);
         if (r == g_children[i].pid) {
+            drain_child_output(&g_children[i]); /* catch final buffered output */
+            close(g_children[i].readfd);
             unlink(g_children[i].path);
             g_children[i].used = 0;
             continue;
@@ -105,6 +227,8 @@ static void reap_children(int force_all)
                     (int)g_children[i].pid, CHILD_TIMEOUT_S);
             kill(g_children[i].pid, SIGKILL);
             waitpid(g_children[i].pid, &status, 0);
+            drain_child_output(&g_children[i]);
+            close(g_children[i].readfd);
             unlink(g_children[i].path);
             g_children[i].used = 0;
         }
@@ -124,19 +248,35 @@ static void launch_decode(const char *path)
         slot = 0;
     }
 
+    int pfd[2];
+    if (pipe(pfd) != 0) {
+        perror("pipe");
+        unlink(path);
+        return;
+    }
+
     pid_t pid = fork();
     if (pid == 0) {
+        close(pfd[0]);
+        dup2(pfd[1], STDOUT_FILENO);
+        close(pfd[1]);
         execlp(FT8D_PATH, "ft8d", path, (char *)NULL);
         perror("execlp ft8d");
         _exit(127);
     } else if (pid > 0) {
+        close(pfd[1]);
+        fcntl(pfd[0], F_SETFL, O_NONBLOCK);
         strncpy(g_children[slot].path, path, sizeof(g_children[slot].path) - 1);
         g_children[slot].path[sizeof(g_children[slot].path) - 1] = '\0';
         g_children[slot].pid = pid;
         g_children[slot].started = time(NULL);
+        g_children[slot].readfd = pfd[0];
+        g_children[slot].linelen = 0;
         g_children[slot].used = 1;
     } else {
         perror("fork");
+        close(pfd[0]);
+        close(pfd[1]);
         unlink(path);
     }
 }
@@ -250,13 +390,37 @@ static int rx_callback(airspyhf_transfer_t *transfer)
 int main(int argc, char **argv)
 {
     double freq_khz = -1.0;
+    const char *home_arg = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-f") == 0 && i + 1 < argc)
             freq_khz = atof(argv[++i]);
+        else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc)
+            home_arg = argv[++i];
     }
     if (freq_khz <= 0.0) {
-        fprintf(stderr, "Usage: %s -f <freq_kHz>\n", argv[0]);
+        fprintf(stderr, "Usage: %s -f <freq_kHz> [-h <home_locator>]\n", argv[0]);
         return 1;
+    }
+    if (home_arg) {
+        char g[5];
+        size_t hl = strlen(home_arg);
+        if (hl != 4) {
+            fprintf(stderr, "invalid -h locator '%s' (need exactly 4 characters)\n",
+                    home_arg);
+            return 1;
+        }
+        g[0] = (char)toupper((unsigned char)home_arg[0]);
+        g[1] = (char)toupper((unsigned char)home_arg[1]);
+        g[2] = home_arg[2];
+        g[3] = home_arg[3];
+        g[4] = '\0';
+        if (!is_valid_grid4(g)) {
+            fprintf(stderr, "invalid -h locator '%s' (expected e.g. JO70)\n", home_arg);
+            return 1;
+        }
+        grid_to_latlon(g, &g_home_lat, &g_home_lon);
+        strncpy(g_home_grid, g, sizeof(g_home_grid) - 1);
+        g_have_home = 1;
     }
     g_dial_freq_hz = freq_khz * 1000.0;
     g_rf_center_hz = g_dial_freq_hz + FREQ_OFFSET_HZ;
@@ -304,9 +468,11 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "receiving dial %.3f kHz (RF center %.3f kHz, "
-            "covering %.0f - %.0f Hz), Ctrl+C to stop\n",
+            "covering %.0f - %.0f Hz)%s%s, Ctrl+C to stop\n",
             freq_khz, g_rf_center_hz / 1000.0,
-            g_rf_center_hz - 1600.0, g_rf_center_hz + 1600.0);
+            g_rf_center_hz - 1600.0, g_rf_center_hz + 1600.0,
+            g_have_home ? ", home " : "",
+            g_have_home ? g_home_grid : "");
     while (!g_stop && airspyhf_is_streaming(dev))
         sleep(1);
 
