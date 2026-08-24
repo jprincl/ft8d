@@ -93,8 +93,8 @@ program ft8d
           allmessages(ndecodes)=msg37
           allsnrs(ndecodes)=nsnr
           write(*,1004) dtime,min(sync,999.0),nint(xsnr), &
-              xdt,nint(f1-2000+dialfreq),msg37
-1004      format(a6,1x,f6.1,i4,f6.2,i9,1x,a20)
+              xdt,nint(f1-2000+dialfreq),msg37,msgcall
+1004      format(a6,1x,f6.1,i4,f6.2,i9,1x,a20,1x,a13)
         endif
       enddo
     enddo
