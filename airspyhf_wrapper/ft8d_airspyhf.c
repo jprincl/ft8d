@@ -30,7 +30,7 @@
 #define FIR_NTAPS        1025
 #define FIR_CUTOFF_HZ    1900.0
 
-#define FT8D_PATH        "./ft8d"   /* adjust if your layout differs */
+#define FT8D_PATH        "../ft8d"   /* adjust if your layout differs */
 #define MAX_CHILDREN     8
 #define CHILD_TIMEOUT_S  45          /* decode should finish well inside 60 s */
 
@@ -149,8 +149,16 @@ static void write_c2_and_launch(void)
         g_outcount = 0;
         return;
     }
-    fwrite(g_outbuf, sizeof(cplx32_t), NMAX, f);
+    size_t n = fwrite(g_outbuf, sizeof(cplx32_t), NMAX, f);
     fclose(f);
+    if (n != NMAX) {
+        fprintf(stderr, "short write on %s (%zu/%d samples), skipping\n",
+                path, n, NMAX);
+        unlink(path);
+        g_outcount = 0;
+        return;
+    }
+    fprintf(stderr, "captured 15s -> %s, launching ft8d\n", path);
 
     launch_decode(path);
     g_outcount = 0;
@@ -241,7 +249,14 @@ int main(int argc, char **argv)
     }
 
     airspyhf_set_samplerate(dev, SAMPLE_RATE_HZ);
-    airspyhf_set_freq(dev, (uint32_t)g_dial_freq_hz);
+    /* ft8d.f90 expects "audio zero" 2000 Hz below dialfreq (same convention
+     * as a real SSB receiver -- see nfa+2000/nfb+2000/f1-2000+dialfreq in
+     * ft8d.f90). Our complex receiver instead centers its +/-2000 Hz
+     * passband on whatever it's tuned to, so the actual RF tuning needs to
+     * sit 2000 Hz above the nominal dial frequency for the FT8 sub-band
+     * (dial+400..dial+3600 Hz) to land inside that passband. dialfreq
+     * itself (filename, decode math) stays the plain nominal value. */
+    airspyhf_set_freq(dev, (uint32_t)(g_dial_freq_hz + 2000.0));
     airspyhf_set_hf_agc(dev, 1);   /* matches -g on */
     airspyhf_set_hf_lna(dev, 1);   /* matches -m on */
 
