@@ -51,7 +51,7 @@ program ft8d
     allsnrs=0
     ncontest=0
     lft8apon=.false.
-    ndepth=1
+    ndepth=2
     if(ndepth.eq.1) npass=1
     if(ndepth.eq.2) npass=3
     if(ndepth.ge.3) npass=5
