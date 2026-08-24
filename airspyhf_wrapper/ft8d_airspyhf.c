@@ -79,6 +79,7 @@ typedef enum { SORT_FREQ, SORT_DIST, SORT_SNR } sort_mode_t;
 typedef struct {
     char   prefix[40]; /* dtime..freq, ~32 chars */
     char   msg[64];
+    char   call[16];   /* from ft8d's msgcall -- parsed for future ADIF use, not displayed */
     char   grid[5];
     int    has_grid;
     double dist_km;
@@ -245,7 +246,10 @@ static int cmp_dist(const void *a, const void *b) /* farthest first, no-distance
  * on the child (rather than printing immediately), so a full 15s cycle's
  * worth of decodes can be sorted together once ft8d exits. Splits the
  * fixed-width Fortran prefix precisely rather than relying on its a20
- * message padding, which breaks down for messages over 20 chars. */
+ * message padding, which breaks down for messages over 20 chars.
+ * msgcall (the trailing field) is peeled from the END of the line
+ * instead, since its Fortran type (character*13) makes that width
+ * genuinely guaranteed, unlike msg37's a20 which can overflow. */
 static void process_decode_line(child_t *c, char *line)
 {
     size_t len = strlen(line);
@@ -255,20 +259,35 @@ static void process_decode_line(child_t *c, char *line)
 
     const size_t PREFIX_LEN = 32;
     char prefix[40];
-    const char *msg_start;
+    size_t body_start, body_len;
     if (len > PREFIX_LEN + 1) {
         size_t n = PREFIX_LEN < sizeof(prefix) - 1 ? PREFIX_LEN : sizeof(prefix) - 1;
         memcpy(prefix, line, n);
         prefix[n] = '\0';
-        msg_start = line + PREFIX_LEN + 1; /* skip the 1x separator */
+        body_start = PREFIX_LEN + 1; /* skip the 1x separator */
+        body_len = len - body_start;
     } else {
         prefix[0] = '\0';
-        msg_start = line;
+        body_start = 0;
+        body_len = len;
+    }
+
+    /* peel msgcall off the end of the body, if there's room for it */
+    char call[16] = {0};
+    const size_t CALL_LEN = 13;
+    if (body_len > CALL_LEN + 1) {
+        size_t call_off = body_start + body_len - CALL_LEN;
+        memcpy(call, line + call_off, CALL_LEN);
+        call[CALL_LEN] = '\0';
+        size_t clen = strlen(call);
+        while (clen > 0 && isspace((unsigned char)call[clen - 1])) call[--clen] = '\0';
+        body_len -= CALL_LEN + 1; /* also drop the 1x separator before it */
     }
 
     char msg[64];
-    strncpy(msg, msg_start, sizeof(msg) - 1);
-    msg[sizeof(msg) - 1] = '\0';
+    size_t n = body_len < sizeof(msg) - 1 ? body_len : sizeof(msg) - 1;
+    memcpy(msg, line + body_start, n);
+    msg[n] = '\0';
     size_t mlen = strlen(msg);
     while (mlen > 0 && isspace((unsigned char)msg[mlen - 1]))
         msg[--mlen] = '\0';
@@ -280,6 +299,8 @@ static void process_decode_line(child_t *c, char *line)
     r->prefix[sizeof(r->prefix) - 1] = '\0';
     strncpy(r->msg, msg, sizeof(r->msg) - 1);
     r->msg[sizeof(r->msg) - 1] = '\0';
+    strncpy(r->call, call, sizeof(r->call) - 1);
+    r->call[sizeof(r->call) - 1] = '\0';
     r->freq_hz = parse_field(prefix, 23, 9);
     r->snr = parse_field(prefix, 13, 4);
 
@@ -314,15 +335,23 @@ static void flush_child_output(child_t *c)
 
         for (int i = 0; i < c->nrecs; i++) {
             decode_rec_t *r = &c->recs[i];
+
+            /* r->prefix is "dtime sync snr dt freq" (a6,1x,f6.1,i4,f6.2,i9).
+             * Drop the sync field, positions 7 through 12, for display --
+             * it's an internal sync8 metric, not useful once a line has
+             * already passed CRC and made it this far. */
+            char display_prefix[32];
+            snprintf(display_prefix, sizeof(display_prefix), "%.7s%s",
+                     r->prefix, r->prefix + 13);
+
             char outline[160];
+            int off = snprintf(outline, sizeof(outline), "%s %-20s %-13s",
+                                display_prefix, r->msg, r->call);
             if (r->has_grid && r->has_dist)
-                snprintf(outline, sizeof(outline), "%s %-20s %-6s %6.0fkm",
-                         r->prefix, r->msg, r->grid, r->dist_km);
+                snprintf(outline + off, sizeof(outline) - off, " %-6s %6.0fkm",
+                         r->grid, r->dist_km);
             else if (r->has_grid)
-                snprintf(outline, sizeof(outline), "%s %-20s %-6s",
-                         r->prefix, r->msg, r->grid);
-            else
-                snprintf(outline, sizeof(outline), "%s %-20s", r->prefix, r->msg);
+                snprintf(outline + off, sizeof(outline) - off, " %-6s", r->grid);
 
             if (g_want_screen) printf("%s\n", outline);
             if (g_logfile) fprintf(g_logfile, "%s\n", outline);
