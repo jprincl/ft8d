@@ -34,6 +34,16 @@
 #define MAX_CHILDREN     8
 #define CHILD_TIMEOUT_S  45          /* decode should finish well inside 60 s */
 
+/* ft8d.f90's search window is +/-1600 Hz, symmetric around whatever
+ * "dialfreq" ends up embedded in the .c2 filename. Real FT8 activity on a
+ * given band conventionally spans roughly dial+200 to dial+2900 Hz (the
+ * usual USB-audio convention), which is wider than +/-1600 Hz centered on
+ * the plain dial. Shifting the actual RF center (and the dialfreq we
+ * embed -- both together, consistently) by this much centers the window
+ * on that real activity band instead, with margin on both sides. 1500 Hz
+ * matches the value from Jan's original working shell script. */
+#define FREQ_OFFSET_HZ   1500.0
+
 typedef struct { float re, im; } cplx32_t;
 
 typedef struct {
@@ -43,7 +53,8 @@ typedef struct {
     int     used;
 } child_t;
 
-static double        g_dial_freq_hz = 14074000.0;
+static double        g_dial_freq_hz = 14074000.0;  /* nominal, for display only */
+static double        g_rf_center_hz = 0.0;          /* dial + FREQ_OFFSET_HZ -- used for BOTH tuning and the .c2 filename, must always match */
 static float          g_fir_coef[FIR_NTAPS];
 static cplx32_t        g_fir_hist[FIR_NTAPS];
 static int              g_fir_pos = 0;
@@ -141,7 +152,7 @@ static void write_c2_and_launch(void)
 
     char path[160];
     snprintf(path, sizeof(path), "/dev/shm/ft8_%02d%02d%02d_%08.0f.c2",
-             tmv.tm_hour, tmv.tm_min, tmv.tm_sec, g_dial_freq_hz);
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec, g_rf_center_hz);
 
     FILE *f = fopen(path, "wb");
     if (!f) {
@@ -248,6 +259,7 @@ int main(int argc, char **argv)
         return 1;
     }
     g_dial_freq_hz = freq_khz * 1000.0;
+    g_rf_center_hz = g_dial_freq_hz + FREQ_OFFSET_HZ;
 
     design_lowpass(g_fir_coef, FIR_NTAPS, (double)SAMPLE_RATE_HZ, FIR_CUTOFF_HZ);
     memset(g_children, 0, sizeof(g_children));
@@ -277,14 +289,11 @@ int main(int argc, char **argv)
     }
 
     airspyhf_set_samplerate(dev, SAMPLE_RATE_HZ);
-    /* ft8d.f90 expects "audio zero" 2000 Hz below dialfreq (same convention
-     * as a real SSB receiver -- see nfa+2000/nfb+2000/f1-2000+dialfreq in
-     * ft8d.f90). Our complex receiver instead centers its +/-2000 Hz
-     * passband on whatever it's tuned to, so the actual RF tuning needs to
-     * sit 2000 Hz above the nominal dial frequency for the FT8 sub-band
-     * (dial+400..dial+3600 Hz) to land inside that passband. dialfreq
-     * itself (filename, decode math) stays the plain nominal value. */
-    airspyhf_set_freq(dev, (uint32_t)(g_dial_freq_hz + 2000.0));
+    /* Tune to g_rf_center_hz (dial + FREQ_OFFSET_HZ), the SAME value used
+     * in the .c2 filename above -- hardware tuning and the embedded
+     * dialfreq must always match, or the frequency column comes out
+     * wrong even though decoding itself still works fine. */
+    airspyhf_set_freq(dev, (uint32_t)g_rf_center_hz);
     airspyhf_set_hf_agc(dev, 1);   /* matches -g on */
     airspyhf_set_hf_lna(dev, 1);   /* matches -m on */
 
@@ -294,7 +303,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    fprintf(stderr, "receiving on %.3f kHz, Ctrl+C to stop\n", freq_khz);
+    fprintf(stderr, "receiving dial %.3f kHz (RF center %.3f kHz, "
+            "covering %.0f - %.0f Hz), Ctrl+C to stop\n",
+            freq_khz, g_rf_center_hz / 1000.0,
+            g_rf_center_hz - 1600.0, g_rf_center_hz + 1600.0);
     while (!g_stop && airspyhf_is_streaming(dev))
         sleep(1);
 
