@@ -5,7 +5,8 @@
  * v1: single fixed frequency, no band rotation yet (that comes later).
  *
  * Usage: ft8d_airspyhf -f <freq_kHz> [-h <home_locator>] [-sf|-sd|-sn]
- *   e.g. ft8d_airspyhf -f 14074 -h JO70 -sd
+ *                       [-l <log_dir>] [-q]
+ *   e.g. ft8d_airspyhf -f 14074 -h JO70 -sd -l /home/odroid/ft8logs
  *
  * -h is optional. When given, a genuine locator found in a decoded
  * message gets a distance-in-km column appended (e.g. "JN53  1560km").
@@ -18,12 +19,23 @@
  *   -sd  distance descending (farthest first); rows without a distance
  *        (no -h given, or no locator in the message) sort last
  *   -sn  SNR descending (strongest first)
+ *
+ * -l <log_dir>  also write decodes (no tracing info) to a file named
+ *               ft8_<startdate><starttime>_<freq_Hz>.txt in that
+ *               directory, e.g. ft8_20260824080614_14075500.txt.
+ *               Each 15s interval, decoded or not, ends with a blank
+ *               line so the log shows a continuous timeline.
+ * -q            suppress screen output. Only useful together with -l --
+ *               refused if given without it (nothing would go anywhere).
+ * Default (neither given): screen only, as before. -l alone: both.
+ * -l with -q: file only.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
 #include <math.h>
 #include <time.h>
 #include <signal.h>
@@ -102,6 +114,9 @@ static sort_mode_t            g_sort_mode = SORT_FREQ;
 static int    g_have_home = 0;
 static double g_home_lat = 0.0, g_home_lon = 0.0;
 static char   g_home_grid[8] = {0};
+
+static int    g_want_screen = 1; /* -q turns this off */
+static FILE  *g_logfile = NULL;  /* set when -l is given */
 
 static void handle_sigint(int sig) { (void)sig; g_stop = 1; }
 
@@ -284,25 +299,37 @@ static void process_decode_line(child_t *c, char *line)
     }
 }
 
-/* Sort this child's buffered decodes per g_sort_mode and print them. */
+/* Sort this child's buffered decodes per g_sort_mode and write them to
+ * whichever destination(s) are active (screen and/or log file -- the
+ * log file only ever gets decode lines, never the stderr tracing).
+ * Every interval, including a quiet one with zero decodes, ends with a
+ * blank-line separator so the log shows a continuous timeline. */
 static void flush_child_output(child_t *c)
 {
-    if (c->nrecs == 0) return;
-    int (*cmp)(const void *, const void *) = cmp_freq;
-    if (g_sort_mode == SORT_DIST) cmp = cmp_dist;
-    else if (g_sort_mode == SORT_SNR) cmp = cmp_snr;
-    qsort(c->recs, c->nrecs, sizeof(c->recs[0]), cmp);
+    if (c->nrecs > 0) {
+        int (*cmp)(const void *, const void *) = cmp_freq;
+        if (g_sort_mode == SORT_DIST) cmp = cmp_dist;
+        else if (g_sort_mode == SORT_SNR) cmp = cmp_snr;
+        qsort(c->recs, c->nrecs, sizeof(c->recs[0]), cmp);
 
-    for (int i = 0; i < c->nrecs; i++) {
-        decode_rec_t *r = &c->recs[i];
-        if (r->has_grid && r->has_dist)
-            printf("%s %-20s %-6s %6.0fkm\n", r->prefix, r->msg, r->grid, r->dist_km);
-        else if (r->has_grid)
-            printf("%s %-20s %-6s\n", r->prefix, r->msg, r->grid);
-        else
-            printf("%s %-20s\n", r->prefix, r->msg);
+        for (int i = 0; i < c->nrecs; i++) {
+            decode_rec_t *r = &c->recs[i];
+            char outline[160];
+            if (r->has_grid && r->has_dist)
+                snprintf(outline, sizeof(outline), "%s %-20s %-6s %6.0fkm",
+                         r->prefix, r->msg, r->grid, r->dist_km);
+            else if (r->has_grid)
+                snprintf(outline, sizeof(outline), "%s %-20s %-6s",
+                         r->prefix, r->msg, r->grid);
+            else
+                snprintf(outline, sizeof(outline), "%s %-20s", r->prefix, r->msg);
+
+            if (g_want_screen) printf("%s\n", outline);
+            if (g_logfile) fprintf(g_logfile, "%s\n", outline);
+        }
     }
-    fflush(stdout);
+    if (g_want_screen) { printf("\n"); fflush(stdout); }
+    if (g_logfile) { fprintf(g_logfile, "\n"); fflush(g_logfile); }
     c->nrecs = 0;
 }
 
@@ -517,6 +544,7 @@ int main(int argc, char **argv)
 {
     double freq_khz = -1.0;
     const char *home_arg = NULL;
+    const char *log_dir = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-f") == 0 && i + 1 < argc)
             freq_khz = atof(argv[++i]);
@@ -528,10 +556,24 @@ int main(int argc, char **argv)
             g_sort_mode = SORT_DIST;
         else if (strcmp(argv[i], "-sn") == 0)
             g_sort_mode = SORT_SNR;
+        else if (strcmp(argv[i], "-l") == 0) {
+            /* -l with no path (end of args, or another flag right after)
+             * means "current directory", not "silently ignore -l". */
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                log_dir = argv[++i];
+            else
+                log_dir = ".";
+        }
+        else if (strcmp(argv[i], "-q") == 0)
+            g_want_screen = 0;
     }
     if (freq_khz <= 0.0) {
-        fprintf(stderr, "Usage: %s -f <freq_kHz> [-h <home_locator>] [-sf|-sd|-sn]\n",
-                argv[0]);
+        fprintf(stderr, "Usage: %s -f <freq_kHz> [-h <home_locator>] "
+                "[-sf|-sd|-sn] [-l <log_dir>] [-q]\n", argv[0]);
+        return 1;
+    }
+    if (!g_want_screen && !log_dir) {
+        fprintf(stderr, "-q with no -l means no output would go anywhere\n");
         return 1;
     }
     if (home_arg) {
@@ -557,6 +599,27 @@ int main(int argc, char **argv)
     }
     g_dial_freq_hz = freq_khz * 1000.0;
     g_rf_center_hz = g_dial_freq_hz + FREQ_OFFSET_HZ;
+
+    if (log_dir) {
+        time_t start = time(NULL);
+        struct tm tmv;
+        gmtime_r(&start, &tmv);
+        size_t dl = strlen(log_dir);
+        const char *sep = (dl > 0 && log_dir[dl - 1] == '/') ? "" : "/";
+        char logpath[512];
+        snprintf(logpath, sizeof(logpath),
+                 "%s%sft8_%04d%02d%02d%02d%02d%02d_%.0f.txt",
+                 log_dir, sep,
+                 tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                 tmv.tm_hour, tmv.tm_min, tmv.tm_sec, g_dial_freq_hz);
+        g_logfile = fopen(logpath, "a");
+        if (!g_logfile) {
+            fprintf(stderr, "could not open log file %s: %s\n",
+                    logpath, strerror(errno));
+            return 1;
+        }
+        fprintf(stderr, "logging decodes to %s\n", logpath);
+    }
 
     design_lowpass(g_fir_coef, FIR_NTAPS, (double)SAMPLE_RATE_HZ, FIR_CUTOFF_HZ);
     memset(g_children, 0, sizeof(g_children));
@@ -615,5 +678,6 @@ int main(int argc, char **argv)
     airspyhf_stop(dev);
     airspyhf_close(dev);
     reap_children(1);
+    if (g_logfile) fclose(g_logfile);
     return 0;
 }
