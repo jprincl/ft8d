@@ -4,13 +4,20 @@
  *
  * v1: single fixed frequency, no band rotation yet (that comes later).
  *
- * Usage: ft8d_airspyhf -f <freq_kHz> [-h <home_locator>]
- *   e.g. ft8d_airspyhf -f 14074 -h JO70
+ * Usage: ft8d_airspyhf -f <freq_kHz> [-h <home_locator>] [-sf|-sd|-sn]
+ *   e.g. ft8d_airspyhf -f 14074 -h JO70 -sd
  *
  * -h is optional. When given, a genuine locator found in a decoded
  * message gets a distance-in-km column appended (e.g. "JN53  1560km").
  * RR73/RRR/73 and signal reports are never treated as locators, even
  * though some are syntactically indistinguishable from a real grid.
+ *
+ * -sf/-sd/-sn pick how each 15s cycle's decodes are sorted before being
+ * printed (all at once, once ft8d for that cycle exits):
+ *   -sf  frequency ascending (default)
+ *   -sd  distance descending (farthest first); rows without a distance
+ *        (no -h given, or no locator in the message) sort last
+ *   -sn  SNR descending (strongest first)
  */
 
 #include <stdio.h>
@@ -51,7 +58,22 @@
  * matches the value from Jan's original working shell script. */
 #define FREQ_OFFSET_HZ   1500.0
 
+#define MAX_RECS_PER_CYCLE 128
+
 typedef struct { float re, im; } cplx32_t;
+
+typedef enum { SORT_FREQ, SORT_DIST, SORT_SNR } sort_mode_t;
+
+typedef struct {
+    char   prefix[40]; /* dtime..freq, ~32 chars */
+    char   msg[64];
+    char   grid[5];
+    int    has_grid;
+    double dist_km;
+    int    has_dist;
+    double freq_hz;
+    double snr;
+} decode_rec_t;
 
 typedef struct {
     pid_t   pid;
@@ -61,6 +83,8 @@ typedef struct {
     int     readfd;       /* read end of ft8d's redirected stdout */
     char    linebuf[256]; /* partial (not yet newline-terminated) output */
     int     linelen;
+    decode_rec_t recs[MAX_RECS_PER_CYCLE];
+    int          nrecs;
 } child_t;
 
 static double        g_dial_freq_hz = 14074000.0;  /* nominal, for display only */
@@ -73,6 +97,7 @@ static cplx32_t          g_outbuf[NMAX];
 static int                g_outcount = 0;
 static child_t             g_children[MAX_CHILDREN];
 static volatile sig_atomic_t g_stop = 0;
+static sort_mode_t            g_sort_mode = SORT_FREQ;
 
 static int    g_have_home = 0;
 static double g_home_lat = 0.0, g_home_lon = 0.0;
@@ -157,21 +182,64 @@ static int extract_locator(const char *msg, char *grid_out)
     return 1;
 }
 
-/* Parse a completed line from ft8d's stdout, append locator/distance
- * columns if applicable, and print the result with fixed-width columns
- * we control ourselves (Fortran's a20 padding for the message breaks
- * down for any message over 20 chars, so we don't rely on it). */
-static void process_decode_line(char *line)
+/* Reads up to `len` chars starting at `start` from s (bounds-checked
+ * against s's actual length) and parses them as a number. Returns 0.0
+ * for anything out of range instead of reading past the string. */
+static double parse_field(const char *s, int start, int len)
+{
+    int slen = (int)strlen(s);
+    if (start >= slen) return 0.0;
+    int avail = slen - start;
+    int n = len < avail ? len : avail;
+    if (n <= 0) return 0.0;
+    char buf[16];
+    int m = n < (int)sizeof(buf) - 1 ? n : (int)sizeof(buf) - 1;
+    memcpy(buf, s + start, m);
+    buf[m] = '\0';
+    return atof(buf);
+}
+
+static int cmp_freq(const void *a, const void *b)
+{
+    const decode_rec_t *ra = a, *rb = b;
+    if (ra->freq_hz < rb->freq_hz) return -1;
+    if (ra->freq_hz > rb->freq_hz) return 1;
+    return 0;
+}
+
+static int cmp_snr(const void *a, const void *b) /* highest SNR first */
+{
+    const decode_rec_t *ra = a, *rb = b;
+    if (ra->snr > rb->snr) return -1;
+    if (ra->snr < rb->snr) return 1;
+    return 0;
+}
+
+static int cmp_dist(const void *a, const void *b) /* farthest first, no-distance rows last */
+{
+    const decode_rec_t *ra = a, *rb = b;
+    if (ra->has_dist != rb->has_dist)
+        return ra->has_dist ? -1 : 1;
+    if (!ra->has_dist) return 0;
+    if (ra->dist_km > rb->dist_km) return -1;
+    if (ra->dist_km < rb->dist_km) return 1;
+    return 0;
+}
+
+/* Parse a completed line from ft8d's stdout into a record and buffer it
+ * on the child (rather than printing immediately), so a full 15s cycle's
+ * worth of decodes can be sorted together once ft8d exits. Splits the
+ * fixed-width Fortran prefix precisely rather than relying on its a20
+ * message padding, which breaks down for messages over 20 chars. */
+static void process_decode_line(child_t *c, char *line)
 {
     size_t len = strlen(line);
     while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
         line[--len] = '\0';
     if (len == 0) return;
 
-    /* ft8d.f90's format is a6,1x,f6.1,i4,f6.2,i9,1x,a20 -- dtime..freq is
-     * reliably 32 chars, message starts right after the following space. */
     const size_t PREFIX_LEN = 32;
-    char prefix[64];
+    char prefix[40];
     const char *msg_start;
     if (len > PREFIX_LEN + 1) {
         size_t n = PREFIX_LEN < sizeof(prefix) - 1 ? PREFIX_LEN : sizeof(prefix) - 1;
@@ -191,20 +259,51 @@ static void process_decode_line(char *line)
         msg[--mlen] = '\0';
     if (mlen == 0) return;
 
-    char grid[5];
-    if (extract_locator(msg, grid)) {
+    if (c->nrecs >= MAX_RECS_PER_CYCLE) return; /* silently drop past the cap */
+    decode_rec_t *r = &c->recs[c->nrecs++];
+    strncpy(r->prefix, prefix, sizeof(r->prefix) - 1);
+    r->prefix[sizeof(r->prefix) - 1] = '\0';
+    strncpy(r->msg, msg, sizeof(r->msg) - 1);
+    r->msg[sizeof(r->msg) - 1] = '\0';
+    r->freq_hz = parse_field(prefix, 23, 9);
+    r->snr = parse_field(prefix, 13, 4);
+
+    if (extract_locator(msg, r->grid)) {
+        r->has_grid = 1;
         if (g_have_home) {
             double lat, lon;
-            grid_to_latlon(grid, &lat, &lon);
-            double dist = haversine_km(g_home_lat, g_home_lon, lat, lon);
-            printf("%s %-20s %-6s %6.0fkm\n", prefix, msg, grid, dist);
+            grid_to_latlon(r->grid, &lat, &lon);
+            r->dist_km = haversine_km(g_home_lat, g_home_lon, lat, lon);
+            r->has_dist = 1;
         } else {
-            printf("%s %-20s %-6s\n", prefix, msg, grid);
+            r->has_dist = 0;
         }
     } else {
-        printf("%s %-20s\n", prefix, msg);
+        r->has_grid = 0;
+        r->has_dist = 0;
+    }
+}
+
+/* Sort this child's buffered decodes per g_sort_mode and print them. */
+static void flush_child_output(child_t *c)
+{
+    if (c->nrecs == 0) return;
+    int (*cmp)(const void *, const void *) = cmp_freq;
+    if (g_sort_mode == SORT_DIST) cmp = cmp_dist;
+    else if (g_sort_mode == SORT_SNR) cmp = cmp_snr;
+    qsort(c->recs, c->nrecs, sizeof(c->recs[0]), cmp);
+
+    for (int i = 0; i < c->nrecs; i++) {
+        decode_rec_t *r = &c->recs[i];
+        if (r->has_grid && r->has_dist)
+            printf("%s %-20s %-6s %6.0fkm\n", r->prefix, r->msg, r->grid, r->dist_km);
+        else if (r->has_grid)
+            printf("%s %-20s %-6s\n", r->prefix, r->msg, r->grid);
+        else
+            printf("%s %-20s\n", r->prefix, r->msg);
     }
     fflush(stdout);
+    c->nrecs = 0;
 }
 
 /* Non-blocking drain of whatever ft8d has written so far, processing
@@ -221,7 +320,7 @@ static void drain_child_output(child_t *c)
                 c->linebuf[c->linelen++] = buf[i];
             if (buf[i] == '\n') {
                 c->linebuf[c->linelen] = '\0';
-                process_decode_line(c->linebuf);
+                process_decode_line(c, c->linebuf);
                 c->linelen = 0;
             }
         }
@@ -241,6 +340,7 @@ static void reap_children(int force_all)
         pid_t r = waitpid(g_children[i].pid, &status, WNOHANG);
         if (r == g_children[i].pid) {
             drain_child_output(&g_children[i]); /* catch final buffered output */
+            flush_child_output(&g_children[i]);
             close(g_children[i].readfd);
             unlink(g_children[i].path);
             g_children[i].used = 0;
@@ -252,6 +352,7 @@ static void reap_children(int force_all)
             kill(g_children[i].pid, SIGKILL);
             waitpid(g_children[i].pid, &status, 0);
             drain_child_output(&g_children[i]);
+            flush_child_output(&g_children[i]);
             close(g_children[i].readfd);
             unlink(g_children[i].path);
             g_children[i].used = 0;
@@ -296,6 +397,7 @@ static void launch_decode(const char *path)
         g_children[slot].started = time(NULL);
         g_children[slot].readfd = pfd[0];
         g_children[slot].linelen = 0;
+        g_children[slot].nrecs = 0;
         g_children[slot].used = 1;
     } else {
         perror("fork");
@@ -420,9 +522,16 @@ int main(int argc, char **argv)
             freq_khz = atof(argv[++i]);
         else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc)
             home_arg = argv[++i];
+        else if (strcmp(argv[i], "-sf") == 0)
+            g_sort_mode = SORT_FREQ;
+        else if (strcmp(argv[i], "-sd") == 0)
+            g_sort_mode = SORT_DIST;
+        else if (strcmp(argv[i], "-sn") == 0)
+            g_sort_mode = SORT_SNR;
     }
     if (freq_khz <= 0.0) {
-        fprintf(stderr, "Usage: %s -f <freq_kHz> [-h <home_locator>]\n", argv[0]);
+        fprintf(stderr, "Usage: %s -f <freq_kHz> [-h <home_locator>] [-sf|-sd|-sn]\n",
+                argv[0]);
         return 1;
     }
     if (home_arg) {
@@ -491,12 +600,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    const char *sort_name = g_sort_mode == SORT_DIST ? "distance" :
+                             g_sort_mode == SORT_SNR  ? "SNR" : "frequency";
     fprintf(stderr, "receiving dial %.3f kHz (RF center %.3f kHz, "
-            "covering %.0f - %.0f Hz)%s%s, Ctrl+C to stop\n",
+            "covering %.0f - %.0f Hz)%s%s, sort by %s, Ctrl+C to stop\n",
             freq_khz, g_rf_center_hz / 1000.0,
             g_rf_center_hz - 1600.0, g_rf_center_hz + 1600.0,
             g_have_home ? ", home " : "",
-            g_have_home ? g_home_grid : "");
+            g_have_home ? g_home_grid : "",
+            sort_name);
     while (!g_stop && airspyhf_is_streaming(dev))
         sleep(1);
 
