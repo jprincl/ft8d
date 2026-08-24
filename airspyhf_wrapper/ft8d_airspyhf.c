@@ -195,8 +195,17 @@ static void feed_sample(airspyhf_complex_float_t s)
     append_output_sample(acc_re, acc_im);
 }
 
+static int g_first_seen = 0;
+
 static int rx_callback(airspyhf_transfer_t *transfer)
 {
+    if (!g_first_seen) {
+        g_first_seen = 1;
+        fprintf(stderr, "first callback: %d samples, dropped=%llu\n",
+                transfer->sample_count,
+                (unsigned long long)transfer->dropped_samples);
+    }
+
     if (transfer->dropped_samples > 0)
         fprintf(stderr, "warning: %llu dropped samples\n",
                 (unsigned long long)transfer->dropped_samples);
