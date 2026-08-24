@@ -4,7 +4,7 @@ program ft8d
 
   include 'ft8_params.f90'
   character infile*80,msg37*37
-  character intime*10
+  character dtime*6
   !character date*6,time*4
   character df*8
   character msgcall*13,msggrid*4
@@ -24,8 +24,8 @@ program ft8d
   apsym(30)=99
 
   nargs=iargc()
-  if(nargs.ne.2) then
-    print*,'Usage: ft8d file time'
+  if(nargs.ne.1) then
+    print*,'Usage: ft8d file'
     go to 999
   endif
 
@@ -34,16 +34,13 @@ program ft8d
   nfqso=0
 
   call getarg(1,infile)
-  call getarg(2,intime)
   open(10,file=infile,status='old',access='stream')
   read(10,end=999) dd
   ! read(10,end=999) dialfreq,dd
   close(10)
   j2=index(infile,'.c2')
-  !df=infile(j2-20:j2-13)
+  dtime=infile(j2-15:j2-10)   ! HHMMSS, expects ..._HHMMSS_FREQ8.c2
   df=infile(j2-8:j2)
-  !date=infile(j2-11:j2-6)
-  !time=infile(j2-4:j2-1)
   read(df ,*) dialfreq
   ! dialfreq = 14074000.0 ! temporary hack
   do ipart=1,1
@@ -95,9 +92,9 @@ program ft8d
           ndecodes=ndecodes+1
           allmessages(ndecodes)=msg37
           allsnrs(ndecodes)=nsnr
-          write(*,1004) intime,15*(ipart-1),min(sync,999.0),nint(xsnr), &
+          write(*,1004) dtime,15*(ipart-1),min(sync,999.0),nint(xsnr), &
               xdt,nint(f1-2000+dialfreq),msg37
-1004      format(a10,1x,i2.2,f6.1,i4,f6.2,i9,1x,a20)
+1004      format(a6,1x,i2.2,f6.1,i4,f6.2,i9,1x,a20)
         endif
       enddo
     enddo
