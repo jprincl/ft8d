@@ -40,6 +40,21 @@
  * Default (neither -l nor -q given): screen only, everything. -l alone:
  * both screen and file, everything. -l with -q: file only. Adding -d
  * filters screen and adds the "_d" file; the main archive is unaffected.
+ *
+ * -k <api_key>  persisted to ~/.ft8d_airspyhf.conf (mode 600) so you don't
+ *               need to retype it -- but never turns uploading on by
+ *               itself.
+ * -c <cloudlog_url>  the actual per-run toggle: upload happens only when
+ *               -c is given THIS run (never saved/remembered), using
+ *               whatever key is available (this run's -k, or the saved
+ *               one). Requires -d -- Cloudlog upload always reuses the
+ *               same per-band dedup state as the diff filter. Uses curl
+ *               as a fire-and-forget subprocess (no libcurl dependency,
+ *               no blocking the audio thread). Fixed two apparent bugs
+ *               from the original 2-year-old script: RST_SENT no longer
+ *               gets a stray "-8" appended, and COMMENT no longer gets a
+ *               trailing ":". FREQ/FREQ_RX are sent in ADIF-standard MHz
+ *               (the old script sent raw Hz).
  */
 
 #define _POSIX_C_SOURCE 200809L /* gmtime_r, strdup -- explicit, don't rely on GNU-dialect defaults */
@@ -54,6 +69,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <libairspyhf/airspyhf.h>
 
@@ -90,6 +106,17 @@
 #define MAX_RECS_PER_CYCLE 128
 #define MAX_BANDS 16
 #define MAX_TRACKED_CALLS 512
+#define MAX_UPLOADS 8
+
+/* Fixed station identity for ADIF records, matching Jan's original
+ * script. MY_GRIDSQUARE deliberately reuses g_home_grid (from -h)
+ * instead of a separate hardcoded constant, so the two always agree. */
+#define CLOUDLOG_OPERATOR  "SWL/OK/THEP111"
+#define CLOUDLOG_CITY      "Hracholusky"
+#define CLOUDLOG_COUNTRY   "CZECH REPUBLIC"
+#define CLOUDLOG_DXCC      "503"
+#define CLOUDLOG_CQ_ZONE   "15"
+#define CLOUDLOG_ITU_ZONE  "28"
 
 typedef struct { float re, im; } cplx32_t;
 
@@ -116,12 +143,15 @@ typedef struct {
     char    linebuf[256]; /* partial (not yet newline-terminated) output */
     int     linelen;
     int     band_idx;     /* which band this decode belongs to, tagged at launch */
+    char    date_str[9];  /* YYYYMMDD at capture time -- ft8d's own dtime is HHMMSS only */
     decode_rec_t recs[MAX_RECS_PER_CYCLE];
     int          nrecs;
 } child_t;
 
 typedef struct { char call[16]; time_t last_seen; } call_seen_t;
 typedef struct { call_seen_t seen[MAX_TRACKED_CALLS]; int count; } band_dedup_t;
+
+typedef struct { pid_t pid; char path[160]; time_t started; int used; } upload_t;
 
 static airspyhf_device_t *g_dev = NULL;
 
@@ -139,6 +169,7 @@ static int              g_decim_ctr = 0;
 static cplx32_t          g_outbuf[NMAX];
 static int                g_outcount = 0;
 static child_t             g_children[MAX_CHILDREN];
+static upload_t             g_uploads[MAX_UPLOADS];
 static volatile sig_atomic_t g_stop = 0;
 static sort_mode_t            g_sort_mode = SORT_FREQ;
 static int                     g_armed = 0; /* have we hit a real 15s UTC boundary yet? */
@@ -155,6 +186,10 @@ static FILE  *g_difffiles[MAX_BANDS]; /* per-band "_d" novelty-only file, needs 
 static int          g_diff_mode = 0;
 static int           g_diff_window_min = 0;
 static band_dedup_t   g_dedup[MAX_BANDS];
+
+static int   g_have_cloudlog = 0;
+static char  g_cloudlog_key[128] = {0};
+static char  g_cloudlog_url[256] = {0};
 
 static void handle_sigint(int sig) { (void)sig; g_stop = 1; }
 
@@ -240,6 +275,197 @@ static int dedup_is_new(int band, const char *call, time_t now)
     d->seen[slot].call[sizeof(d->seen[slot].call) - 1] = '\0';
     d->seen[slot].last_seen = now;
     return 1;
+}
+
+static void cloudlog_config_path(char *buf, size_t n)
+{
+    const char *home = getenv("HOME");
+    snprintf(buf, n, "%s/.ft8d_airspyhf.conf", home ? home : ".");
+}
+
+/* Only fills g_cloudlog_key if it's still empty, so a value already
+ * given on the command line always wins over the saved file. The URL
+ * is deliberately never persisted here -- -c is a per-run toggle for
+ * whether upload happens at all, not a remembered setting, so a saved
+ * key alone can never silently turn uploading back on. */
+static void load_cloudlog_key(void)
+{
+    char path[512];
+    cloudlog_config_path(path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[400];
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (strncmp(line, "api_key=", 8) == 0 && !g_cloudlog_key[0])
+            strncpy(g_cloudlog_key, line + 8, sizeof(g_cloudlog_key) - 1);
+    }
+    fclose(f);
+}
+
+static void save_cloudlog_key(void)
+{
+    char path[512];
+    cloudlog_config_path(path, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "warning: could not save %s: %s\n", path, strerror(errno));
+        return;
+    }
+    fprintf(f, "api_key=%s\n", g_cloudlog_key);
+    fclose(f);
+    chmod(path, S_IRUSR | S_IWUSR); /* 600 -- this file holds a secret */
+}
+
+/* Minimal JSON string escaping for embedding the ADIF blob as a JSON
+ * string value. Caller frees the result. */
+static char *json_escape(const char *s)
+{
+    size_t len = strlen(s);
+    char *out = malloc(len * 2 + 1); /* worst case: every char escaped */
+    if (!out) return NULL;
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') { out[j++] = '\\'; out[j++] = (char)c; }
+        else if (c == '\n') { out[j++] = '\\'; out[j++] = 'n'; }
+        else if (c == '\r') { /* drop */ }
+        else if (c < 0x20) { /* drop other control chars */ }
+        else out[j++] = (char)c;
+    }
+    out[j] = '\0';
+    return out;
+}
+
+static void reap_uploads(int force_all)
+{
+    time_t now = time(NULL);
+    for (int i = 0; i < MAX_UPLOADS; i++) {
+        if (!g_uploads[i].used) continue;
+        int status;
+        pid_t r = waitpid(g_uploads[i].pid, &status, WNOHANG);
+        if (r == g_uploads[i].pid) {
+            unlink(g_uploads[i].path);
+            g_uploads[i].used = 0;
+            continue;
+        }
+        if (force_all || (now - g_uploads[i].started) > 15) {
+            kill(g_uploads[i].pid, SIGKILL);
+            waitpid(g_uploads[i].pid, &status, 0);
+            unlink(g_uploads[i].path);
+            g_uploads[i].used = 0;
+        }
+    }
+}
+
+/* Writes the JSON payload to /dev/shm and fork/execs curl to POST it,
+ * fire-and-forget -- never blocks the audio thread on a slow/unreachable
+ * Cloudlog server. adif_blob may contain multiple <eor>-terminated
+ * records (one per newly-flagged decode this cycle). */
+static void post_to_cloudlog(const char *adif_blob)
+{
+    if (!g_have_cloudlog) return;
+    reap_uploads(0);
+
+    int slot = -1;
+    for (int i = 0; i < MAX_UPLOADS; i++)
+        if (!g_uploads[i].used) { slot = i; break; }
+    if (slot < 0) {
+        reap_uploads(1);
+        slot = 0;
+    }
+
+    char *escaped = json_escape(adif_blob);
+    if (!escaped) return;
+
+    char path[160];
+    snprintf(path, sizeof(path), "/dev/shm/cloudlog_%ld_%d.json",
+             (long)time(NULL), slot);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        perror("fopen cloudlog payload");
+        free(escaped);
+        return;
+    }
+    fprintf(f, "{\"key\":\"%s\",\"station_profile_id\":\"1\",\"type\":\"adif\",\"string\":\"%s\"}",
+            g_cloudlog_key, escaped);
+    fclose(f);
+    free(escaped);
+
+    char data_arg[180];
+    snprintf(data_arg, sizeof(data_arg), "@%s", path);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("curl", "curl", "-s", "-o", "/dev/null",
+               "-w", "cloudlog upload: HTTP %{http_code}\n",
+               "-X", "POST", "-H", "Content-Type: application/json",
+               "-d", data_arg, g_cloudlog_url, (char *)NULL);
+        perror("execlp curl");
+        _exit(127);
+    } else if (pid > 0) {
+        strncpy(g_uploads[slot].path, path, sizeof(g_uploads[slot].path) - 1);
+        g_uploads[slot].path[sizeof(g_uploads[slot].path) - 1] = '\0';
+        g_uploads[slot].pid = pid;
+        g_uploads[slot].started = time(NULL);
+        g_uploads[slot].used = 1;
+    } else {
+        perror("fork");
+        unlink(path);
+    }
+}
+
+/* Builds one ADIF record for a diff-filtered decode. Appends to out
+ * (caller-managed buffer/offset) rather than returning a new string, so
+ * a whole cycle's worth of records can be accumulated into one blob
+ * before a single upload. */
+static void append_adif_record(const decode_rec_t *r, const char *date_str,
+                                char *out, size_t outsz, int *off)
+{
+    char snr_buf[8];
+    snprintf(snr_buf, sizeof(snr_buf), "%d", (int)r->snr);
+
+    char freq_mhz[16];
+    snprintf(freq_mhz, sizeof(freq_mhz), "%.6f", r->freq_hz / 1000000.0);
+
+    char time_str[7];
+    memcpy(time_str, r->prefix, 6); /* dtime is HHMMSS, always the first 6 chars */
+    time_str[6] = '\0';
+
+    int n = *off;
+    n += snprintf(out + n, outsz - (size_t)n, "<CALL:%zu>%s", strlen(r->call), r->call);
+    n += snprintf(out + n, outsz - (size_t)n, "<MODE:3>FT8");
+    if (r->has_grid)
+        n += snprintf(out + n, outsz - (size_t)n, "<GRIDSQUARE:%zu>%s", strlen(r->grid), r->grid);
+    n += snprintf(out + n, outsz - (size_t)n, "<OPERATOR:%zu>%s",
+                  strlen(CLOUDLOG_OPERATOR), CLOUDLOG_OPERATOR);
+    n += snprintf(out + n, outsz - (size_t)n, "<FREQ:%zu>%s", strlen(freq_mhz), freq_mhz);
+    n += snprintf(out + n, outsz - (size_t)n, "<FREQ_RX:%zu>%s", strlen(freq_mhz), freq_mhz);
+    n += snprintf(out + n, outsz - (size_t)n, "<RST_SENT:%zu>%s", strlen(snr_buf), snr_buf);
+    n += snprintf(out + n, outsz - (size_t)n, "<RST_RCVD:3>---");
+    n += snprintf(out + n, outsz - (size_t)n, "<QSO_DATE:8>%s", date_str);
+    n += snprintf(out + n, outsz - (size_t)n, "<TIME_ON:6>%s", time_str);
+    n += snprintf(out + n, outsz - (size_t)n, "<QSO_DATE_OFF:8>%s", date_str);
+    n += snprintf(out + n, outsz - (size_t)n, "<TIME_OFF:6>%s", time_str);
+    n += snprintf(out + n, outsz - (size_t)n, "<STATION_CALLSIGN:%zu>%s",
+                  strlen(CLOUDLOG_OPERATOR), CLOUDLOG_OPERATOR);
+    n += snprintf(out + n, outsz - (size_t)n, "<MY_CITY:%zu>%s",
+                  strlen(CLOUDLOG_CITY), CLOUDLOG_CITY);
+    n += snprintf(out + n, outsz - (size_t)n, "<MY_COUNTRY:%zu>%s",
+                  strlen(CLOUDLOG_COUNTRY), CLOUDLOG_COUNTRY);
+    n += snprintf(out + n, outsz - (size_t)n, "<MY_DXCC:%zu>%s",
+                  strlen(CLOUDLOG_DXCC), CLOUDLOG_DXCC);
+    if (g_have_home)
+        n += snprintf(out + n, outsz - (size_t)n, "<MY_GRIDSQUARE:%zu>%s",
+                      strlen(g_home_grid), g_home_grid);
+    n += snprintf(out + n, outsz - (size_t)n, "<MY_CQ_ZONE:%zu>%s",
+                  strlen(CLOUDLOG_CQ_ZONE), CLOUDLOG_CQ_ZONE);
+    n += snprintf(out + n, outsz - (size_t)n, "<MY_ITU_ZONE:%zu>%s",
+                  strlen(CLOUDLOG_ITU_ZONE), CLOUDLOG_ITU_ZONE);
+    n += snprintf(out + n, outsz - (size_t)n, "<COMMENT:%zu>%s", strlen(r->msg), r->msg);
+    n += snprintf(out + n, outsz - (size_t)n, "<eor>\n");
+    *off = n;
 }
 
 /* Looks at the last whitespace-separated token of the (already-trimmed)
@@ -402,6 +628,8 @@ static void flush_child_output(child_t *c)
     FILE *archive = g_logfiles[band];
     FILE *diff_f = g_difffiles[band];
     time_t now = time(NULL);
+    char adif_blob[MAX_RECS_PER_CYCLE * 220];
+    int  adif_off = 0;
 
     if (c->nrecs > 0) {
         int (*cmp)(const void *, const void *) = cmp_freq;
@@ -435,12 +663,16 @@ static void flush_child_output(child_t *c)
             if (is_new) {
                 if (g_want_screen) printf("%s\n", outline);
                 if (diff_f) fprintf(diff_f, "%s\n", outline);
+                if (g_have_cloudlog)
+                    append_adif_record(r, c->date_str, adif_blob, sizeof(adif_blob), &adif_off);
             }
         }
     }
     if (g_want_screen) { printf("\n"); fflush(stdout); }
     if (archive) { fprintf(archive, "\n"); fflush(archive); }
     if (diff_f) { fprintf(diff_f, "\n"); fflush(diff_f); }
+    if (g_have_cloudlog && adif_off > 0)
+        post_to_cloudlog(adif_blob);
     c->nrecs = 0;
 }
 
@@ -498,7 +730,7 @@ static void reap_children(int force_all)
     }
 }
 
-static void launch_decode(const char *path)
+static void launch_decode(const char *path, const char *date_str)
 {
     reap_children(0);
 
@@ -537,6 +769,8 @@ static void launch_decode(const char *path)
         g_children[slot].linelen = 0;
         g_children[slot].nrecs = 0;
         g_children[slot].band_idx = g_band_idx;
+        strncpy(g_children[slot].date_str, date_str, sizeof(g_children[slot].date_str) - 1);
+        g_children[slot].date_str[sizeof(g_children[slot].date_str) - 1] = '\0';
         g_children[slot].used = 1;
     } else {
         perror("fork");
@@ -600,7 +834,11 @@ static void write_c2_and_launch(void)
     }
     fprintf(stderr, "captured 15s -> %s, launching ft8d\n", path);
 
-    launch_decode(path);
+    char date_str[9];
+    snprintf(date_str, sizeof(date_str), "%04d%02d%02d",
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+
+    launch_decode(path, date_str);
     g_outcount = 0;
     maybe_rotate_band();
 }
@@ -706,10 +944,15 @@ int main(int argc, char **argv)
             g_diff_window_min = atoi(argv[++i]);
             g_diff_mode = 1;
         }
+        else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc)
+            strncpy(g_cloudlog_key, argv[++i], sizeof(g_cloudlog_key) - 1);
+        else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc)
+            strncpy(g_cloudlog_url, argv[++i], sizeof(g_cloudlog_url) - 1);
     }
     if (!freq_arg) {
         fprintf(stderr, "Usage: %s -f <freq_kHz>[,<freq_kHz>...] [-h <home_locator>] "
-                "[-sf|-sd|-sn] [-l <log_dir>] [-q] [-d <minutes>]\n", argv[0]);
+                "[-sf|-sd|-sn] [-l <log_dir>] [-q] [-d <minutes>] [-k <api_key>] "
+                "[-c <cloudlog_url>]\n", argv[0]);
         return 1;
     }
     {
@@ -731,6 +974,22 @@ int main(int argc, char **argv)
     }
     if (g_diff_mode && (g_diff_window_min < 5 || g_diff_window_min > 180)) {
         fprintf(stderr, "-d window must be between 5 and 180 minutes\n");
+        return 1;
+    }
+    if (g_cloudlog_key[0]) {
+        save_cloudlog_key(); /* -k given this run -- remember it for next time */
+    } else {
+        load_cloudlog_key(); /* -k not given -- try the saved one */
+    }
+    g_have_cloudlog = g_cloudlog_url[0] != '\0'; /* -c given THIS run turns upload on */
+    if (g_have_cloudlog && !g_cloudlog_key[0]) {
+        fprintf(stderr, "-c given but no API key available -- pass -k (once, to save it, "
+                "or every run)\n");
+        return 1;
+    }
+    if (g_have_cloudlog && !g_diff_mode) {
+        fprintf(stderr, "-c (Cloudlog upload) requires -d -- only diff-filtered "
+                "decodes get uploaded\n");
         return 1;
     }
     if (home_arg) {
@@ -847,6 +1106,7 @@ int main(int argc, char **argv)
                 g_have_home ? g_home_grid : "",
                 sort_name);
         if (g_diff_mode) fprintf(stderr, ", diff window %d min", g_diff_window_min);
+        if (g_have_cloudlog) fprintf(stderr, ", uploading to Cloudlog");
         fprintf(stderr, ", Ctrl+C to stop\n");
     } else {
         fprintf(stderr, "rotating %d bands (1 min each):", g_nbands);
@@ -855,6 +1115,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "%s%s, sort by %s", g_have_home ? ", home " : "",
                 g_have_home ? g_home_grid : "", sort_name);
         if (g_diff_mode) fprintf(stderr, ", diff window %d min", g_diff_window_min);
+        if (g_have_cloudlog) fprintf(stderr, ", uploading to Cloudlog");
         fprintf(stderr, ", Ctrl+C to stop\n");
     }
     while (!g_stop && airspyhf_is_streaming(g_dev))
@@ -863,6 +1124,7 @@ int main(int argc, char **argv)
     airspyhf_stop(g_dev);
     airspyhf_close(g_dev);
     reap_children(1);
+    reap_uploads(1);
     for (int b = 0; b < g_nbands; b++) {
         if (g_logfiles[b]) fclose(g_logfiles[b]);
         if (g_difffiles[b]) fclose(g_difffiles[b]);
