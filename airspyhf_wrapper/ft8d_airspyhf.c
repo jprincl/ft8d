@@ -148,7 +148,7 @@ typedef struct {
     int          nrecs;
 } child_t;
 
-typedef struct { char call[16]; time_t last_seen; } call_seen_t;
+typedef struct { char call[16]; time_t last_seen; int had_grid; } call_seen_t;
 typedef struct { call_seen_t seen[MAX_TRACKED_CALLS]; int count; } band_dedup_t;
 
 typedef struct { pid_t pid; char path[160]; time_t started; int used; } upload_t;
@@ -244,22 +244,38 @@ static double haversine_km(double lat1, double lon1, double lat2, double lon2)
     return R * c;
 }
 
-/* True if `call` on this band hasn't been flagged as new in the last
- * g_diff_window_min minutes (or has never been seen at all). Per-band,
- * matching the confirmed dedup scope. Mirrors Jan's old diff.sh
- * semantics: the window is measured from when a call was LAST flagged
- * as new, not refreshed on every intervening sighting -- so once it's
- * quiet for the window, it can be flagged again. */
-static int dedup_is_new(int band, const char *call, time_t now)
+/* True if `call` should be shown/uploaded as "new" right now, false to
+ * suppress. Mirrors Jan's old diff.sh semantics: the window is measured
+ * from when a call was LAST flagged as new, not refreshed on every
+ * intervening sighting -- so once it's quiet for the window, it can be
+ * flagged again.
+ *
+ * Also tracks whether the flagged sighting had a confirmed locator: a
+ * callsign first (or repeatedly) heard WITHOUT a grid gets suppressed
+ * normally on repeat sightings, but the MOMENT a grid-bearing sighting
+ * of that same callsign shows up -- even mid-window, even if a grid-less
+ * sighting already "used" that window -- it breaks through once, gets
+ * shown again, and (via the has_grid check at the call site) is what
+ * actually triggers the Cloudlog upload. This is why screen/-d and
+ * Cloudlog no longer need separate dedup tables. */
+static int dedup_check(band_dedup_t *d, const char *call, int has_grid,
+                        time_t now, int window_min)
 {
     if (call[0] == '\0') return 1; /* nothing to key on, don't gate it */
-    band_dedup_t *d = &g_dedup[band];
     for (int i = 0; i < d->count; i++) {
         if (strcmp(d->seen[i].call, call) == 0) {
-            if (now - d->seen[i].last_seen < g_diff_window_min * 60)
-                return 0; /* still within the window, not new */
-            d->seen[i].last_seen = now; /* re-arm */
-            return 1;
+            int expired = (now - d->seen[i].last_seen) >= window_min * 60;
+            if (expired) {
+                d->seen[i].last_seen = now;
+                d->seen[i].had_grid = has_grid;
+                return 1; /* window lapsed -- treat as a fresh sighting */
+            }
+            if (!d->seen[i].had_grid && has_grid) {
+                d->seen[i].last_seen = now;
+                d->seen[i].had_grid = 1;
+                return 1; /* breakthrough: grid just showed up for the first time */
+            }
+            return 0; /* already flagged this window, nothing new to report */
         }
     }
     int slot = d->count;
@@ -274,6 +290,7 @@ static int dedup_is_new(int band, const char *call, time_t now)
     strncpy(d->seen[slot].call, call, sizeof(d->seen[slot].call) - 1);
     d->seen[slot].call[sizeof(d->seen[slot].call) - 1] = '\0';
     d->seen[slot].last_seen = now;
+    d->seen[slot].had_grid = has_grid;
     return 1;
 }
 
@@ -659,11 +676,17 @@ static void flush_child_output(child_t *c)
 
             if (archive) fprintf(archive, "%s\n", outline);
 
-            int is_new = !g_diff_mode || dedup_is_new(band, r->call, now);
+            int is_new = !g_diff_mode ||
+                         dedup_check(&g_dedup[band], r->call, r->has_grid, now, g_diff_window_min);
             if (is_new) {
                 if (g_want_screen) printf("%s\n", outline);
                 if (diff_f) fprintf(diff_f, "%s\n", outline);
-                if (g_have_cloudlog)
+                /* Cloudlog upload rides the same "new" event -- is_new can
+                 * only be true here for a grid-bearing record via a fresh
+                 * sighting or a breakthrough (see dedup_check), so gating
+                 * on has_grid too just guards the case of a genuinely new,
+                 * grid-less first sighting. */
+                if (g_have_cloudlog && r->has_grid)
                     append_adif_record(r, c->date_str, adif_blob, sizeof(adif_blob), &adif_off);
             }
         }
