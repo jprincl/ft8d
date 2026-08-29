@@ -834,8 +834,9 @@ static void write_c2_and_launch(void)
     }
     fprintf(stderr, "captured 15s -> %s, launching ft8d\n", path);
 
-    char date_str[16]; /* worst-case int width for %04d, though the real
-                           value is always exactly 8 digits (YYYYMMDD) */
+    char date_str[64]; /* gcc's -Wformat-truncation sizes worst-case %04d/%02d/%02d
+                           against full int range (up to 34 bytes); the real value
+                           is always exactly 8 digits (YYYYMMDD) */
     snprintf(date_str, sizeof(date_str), "%04d%02d%02d",
              tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
 
