@@ -41,20 +41,29 @@
  * both screen and file, everything. -l with -q: file only. Adding -d
  * filters screen and adds the "_d" file; the main archive is unaffected.
  *
- * -k <api_key>  persisted to ~/.ft8d_airspyhf.conf (mode 600) so you don't
- *               need to retype it -- but never turns uploading on by
- *               itself.
+ * -k <api_key>  -o <operator>  both persisted to ~/.ft8d_airspyhf.conf
+ *               (mode 600) so you don't need to retype them -- but
+ *               neither turns uploading on by itself. -o fills the
+ *               ADIF OPERATOR and STATION_CALLSIGN fields (was hardcoded
+ *               before, now the same override-and-remember pattern as
+ *               the key).
  * -c <cloudlog_url>  the actual per-run toggle: upload happens only when
  *               -c is given THIS run (never saved/remembered), using
- *               whatever key is available (this run's -k, or the saved
- *               one). Requires -d -- Cloudlog upload always reuses the
- *               same per-band dedup state as the diff filter. Uses curl
- *               as a fire-and-forget subprocess (no libcurl dependency,
- *               no blocking the audio thread). Fixed two apparent bugs
- *               from the original 2-year-old script: RST_SENT no longer
- *               gets a stray "-8" appended, and COMMENT no longer gets a
- *               trailing ":". FREQ/FREQ_RX are sent in ADIF-standard MHz
- *               (the old script sent raw Hz).
+ *               whatever key/operator are available (this run's -k/-o,
+ *               or the saved ones). Requires -d -- Cloudlog upload
+ *               always reuses the same per-band dedup state as the diff
+ *               filter. Uses curl as a fire-and-forget subprocess (no
+ *               libcurl dependency, no blocking the audio thread).
+ *               Fixed two apparent bugs from the original 2-year-old
+ *               script: RST_SENT no longer gets a stray "-8" appended,
+ *               and COMMENT no longer gets a trailing ":". FREQ/FREQ_RX
+ *               are sent in ADIF-standard MHz (the old script sent raw
+ *               Hz).
+ * -p <station_profile_id>  which Cloudlog Station Location the upload
+ *               targets (find the ID on the Station Locations page).
+ *               Defaults to "1" if omitted -- prints a one-time warning
+ *               in that case, since defaulting silently is risky on an
+ *               account with more than one location/logbook.
  */
 
 #define _POSIX_C_SOURCE 200809L /* gmtime_r, strdup -- explicit, don't rely on GNU-dialect defaults */
@@ -110,8 +119,9 @@
 
 /* Fixed station identity for ADIF records, matching Jan's original
  * script. MY_GRIDSQUARE deliberately reuses g_home_grid (from -h)
- * instead of a separate hardcoded constant, so the two always agree. */
-#define CLOUDLOG_OPERATOR  "SWL/OK/THEP111"
+ * instead of a separate hardcoded constant, so the two always agree.
+ * OPERATOR/STATION_CALLSIGN is NOT here -- see g_cloudlog_operator,
+ * set via -o and persisted like the API key, not hardcoded. */
 #define CLOUDLOG_CITY      "Hracholusky"
 #define CLOUDLOG_COUNTRY   "CZECH REPUBLIC"
 #define CLOUDLOG_DXCC      "503"
@@ -189,7 +199,10 @@ static band_dedup_t   g_dedup[MAX_BANDS];
 
 static int   g_have_cloudlog = 0;
 static char  g_cloudlog_key[128] = {0};
+static char  g_cloudlog_operator[64] = {0}; /* OPERATOR/STATION_CALLSIGN, per -o, persisted like the key */
 static char  g_cloudlog_url[256] = {0};
+static char  g_cloudlog_profile[16] = "1"; /* Station Location ID, per -p; "1" default */
+static int   g_cloudlog_profile_given = 0;
 
 static void handle_sigint(int sig) { (void)sig; g_stop = 1; }
 
@@ -300,12 +313,12 @@ static void cloudlog_config_path(char *buf, size_t n)
     snprintf(buf, n, "%s/.ft8d_airspyhf.conf", home ? home : ".");
 }
 
-/* Only fills g_cloudlog_key if it's still empty, so a value already
- * given on the command line always wins over the saved file. The URL
- * is deliberately never persisted here -- -c is a per-run toggle for
- * whether upload happens at all, not a remembered setting, so a saved
- * key alone can never silently turn uploading back on. */
-static void load_cloudlog_key(void)
+/* Only fills a field if it's still empty, so a value already given on
+ * the command line always wins over the saved file. The URL is
+ * deliberately never persisted here -- -c is a per-run toggle for
+ * whether upload happens at all, not a remembered setting, so saved
+ * values alone can never silently turn uploading back on. */
+static void load_cloudlog_config(void)
 {
     char path[512];
     cloudlog_config_path(path, sizeof(path));
@@ -317,11 +330,13 @@ static void load_cloudlog_key(void)
         if (nl) *nl = '\0';
         if (strncmp(line, "api_key=", 8) == 0 && !g_cloudlog_key[0])
             strncpy(g_cloudlog_key, line + 8, sizeof(g_cloudlog_key) - 1);
+        else if (strncmp(line, "operator=", 9) == 0 && !g_cloudlog_operator[0])
+            strncpy(g_cloudlog_operator, line + 9, sizeof(g_cloudlog_operator) - 1);
     }
     fclose(f);
 }
 
-static void save_cloudlog_key(void)
+static void save_cloudlog_config(void)
 {
     char path[512];
     cloudlog_config_path(path, sizeof(path));
@@ -330,7 +345,7 @@ static void save_cloudlog_key(void)
         fprintf(stderr, "warning: could not save %s: %s\n", path, strerror(errno));
         return;
     }
-    fprintf(f, "api_key=%s\n", g_cloudlog_key);
+    fprintf(f, "api_key=%s\noperator=%s\n", g_cloudlog_key, g_cloudlog_operator);
     fclose(f);
     chmod(path, S_IRUSR | S_IWUSR); /* 600 -- this file holds a secret */
 }
@@ -405,8 +420,8 @@ static void post_to_cloudlog(const char *adif_blob)
         free(escaped);
         return;
     }
-    fprintf(f, "{\"key\":\"%s\",\"station_profile_id\":\"1\",\"type\":\"adif\",\"string\":\"%s\"}",
-            g_cloudlog_key, escaped);
+    fprintf(f, "{\"key\":\"%s\",\"station_profile_id\":\"%s\",\"type\":\"adif\",\"string\":\"%s\"}",
+            g_cloudlog_key, g_cloudlog_profile, escaped);
     fclose(f);
     free(escaped);
 
@@ -456,7 +471,7 @@ static void append_adif_record(const decode_rec_t *r, const char *date_str,
     if (r->has_grid)
         n += snprintf(out + n, outsz - (size_t)n, "<GRIDSQUARE:%zu>%s", strlen(r->grid), r->grid);
     n += snprintf(out + n, outsz - (size_t)n, "<OPERATOR:%zu>%s",
-                  strlen(CLOUDLOG_OPERATOR), CLOUDLOG_OPERATOR);
+                  strlen(g_cloudlog_operator), g_cloudlog_operator);
     n += snprintf(out + n, outsz - (size_t)n, "<FREQ:%zu>%s", strlen(freq_mhz), freq_mhz);
     n += snprintf(out + n, outsz - (size_t)n, "<FREQ_RX:%zu>%s", strlen(freq_mhz), freq_mhz);
     n += snprintf(out + n, outsz - (size_t)n, "<RST_SENT:%zu>%s", strlen(snr_buf), snr_buf);
@@ -466,7 +481,7 @@ static void append_adif_record(const decode_rec_t *r, const char *date_str,
     n += snprintf(out + n, outsz - (size_t)n, "<QSO_DATE_OFF:8>%s", date_str);
     n += snprintf(out + n, outsz - (size_t)n, "<TIME_OFF:6>%s", time_str);
     n += snprintf(out + n, outsz - (size_t)n, "<STATION_CALLSIGN:%zu>%s",
-                  strlen(CLOUDLOG_OPERATOR), CLOUDLOG_OPERATOR);
+                  strlen(g_cloudlog_operator), g_cloudlog_operator);
     n += snprintf(out + n, outsz - (size_t)n, "<MY_CITY:%zu>%s",
                   strlen(CLOUDLOG_CITY), CLOUDLOG_CITY);
     n += snprintf(out + n, outsz - (size_t)n, "<MY_COUNTRY:%zu>%s",
@@ -971,13 +986,19 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc)
             strncpy(g_cloudlog_key, argv[++i], sizeof(g_cloudlog_key) - 1);
+        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc)
+            strncpy(g_cloudlog_operator, argv[++i], sizeof(g_cloudlog_operator) - 1);
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc)
             strncpy(g_cloudlog_url, argv[++i], sizeof(g_cloudlog_url) - 1);
+        else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+            strncpy(g_cloudlog_profile, argv[++i], sizeof(g_cloudlog_profile) - 1);
+            g_cloudlog_profile_given = 1;
+        }
     }
     if (!freq_arg) {
         fprintf(stderr, "Usage: %s -f <freq_kHz>[,<freq_kHz>...] [-h <home_locator>] "
                 "[-sf|-sd|-sn] [-l <log_dir>] [-q] [-d <minutes>] [-k <api_key>] "
-                "[-c <cloudlog_url>]\n", argv[0]);
+                "[-o <operator>] [-c <cloudlog_url>] [-p <station_profile_id>]\n", argv[0]);
         return 1;
     }
     {
@@ -1001,10 +1022,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "-d window must be between 5 and 180 minutes\n");
         return 1;
     }
-    if (g_cloudlog_key[0]) {
-        save_cloudlog_key(); /* -k given this run -- remember it for next time */
+    if (g_cloudlog_key[0] || g_cloudlog_operator[0]) {
+        /* something given on the command line this run -- fill any gap
+         * from the saved file first, then save the merged result */
+        if (!g_cloudlog_key[0] || !g_cloudlog_operator[0]) load_cloudlog_config();
+        save_cloudlog_config();
     } else {
-        load_cloudlog_key(); /* -k not given -- try the saved one */
+        load_cloudlog_config(); /* neither given -- try the saved file */
     }
     g_have_cloudlog = g_cloudlog_url[0] != '\0'; /* -c given THIS run turns upload on */
     if (g_have_cloudlog && !g_cloudlog_key[0]) {
@@ -1012,10 +1036,20 @@ int main(int argc, char **argv)
                 "or every run)\n");
         return 1;
     }
+    if (g_have_cloudlog && !g_cloudlog_operator[0]) {
+        fprintf(stderr, "-c given but no operator identity available -- pass -o (once, to "
+                "save it, or every run)\n");
+        return 1;
+    }
     if (g_have_cloudlog && !g_diff_mode) {
         fprintf(stderr, "-c (Cloudlog upload) requires -d -- only diff-filtered "
                 "decodes get uploaded\n");
         return 1;
+    }
+    if (g_have_cloudlog && !g_cloudlog_profile_given) {
+        fprintf(stderr, "warning: -c given without -p, defaulting to station_profile_id=1 -- "
+                "if your Cloudlog account has more than one Station Location, check this is "
+                "really the one you want\n");
     }
     if (home_arg) {
         char g[5];
@@ -1131,7 +1165,7 @@ int main(int argc, char **argv)
                 g_have_home ? g_home_grid : "",
                 sort_name);
         if (g_diff_mode) fprintf(stderr, ", diff window %d min", g_diff_window_min);
-        if (g_have_cloudlog) fprintf(stderr, ", uploading to Cloudlog");
+        if (g_have_cloudlog) fprintf(stderr, ", uploading to Cloudlog (profile %s)", g_cloudlog_profile);
         fprintf(stderr, ", Ctrl+C to stop\n");
     } else {
         fprintf(stderr, "rotating %d bands (1 min each):", g_nbands);
@@ -1140,7 +1174,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "%s%s, sort by %s", g_have_home ? ", home " : "",
                 g_have_home ? g_home_grid : "", sort_name);
         if (g_diff_mode) fprintf(stderr, ", diff window %d min", g_diff_window_min);
-        if (g_have_cloudlog) fprintf(stderr, ", uploading to Cloudlog");
+        if (g_have_cloudlog) fprintf(stderr, ", uploading to Cloudlog (profile %s)", g_cloudlog_profile);
         fprintf(stderr, ", Ctrl+C to stop\n");
     }
     while (!g_stop && airspyhf_is_streaming(g_dev))
